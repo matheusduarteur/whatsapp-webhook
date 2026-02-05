@@ -1,0 +1,8 @@
+{
+  "name": "whatsapp-webhook",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "20.x"
+  }
+}
