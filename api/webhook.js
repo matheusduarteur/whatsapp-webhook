@@ -1,18 +1,22 @@
-// api/webhook.js
-// WhatsApp Cloud API webhook + resposta com OpenAI (Vercel Serverless Function)
+// /api/webhook.js
 
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v20.0";
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;         // ex: whatsapp_webhook_verify_123
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;     // EAAG...
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;   // número grandão da Meta
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;     // sk-...
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// =========================
-// Helpers
-// =========================
+// ======= helpers =======
+
 async function sendTextMessage(to, text) {
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+    console.log("❌ Missing WHATSAPP_TOKEN or PHONE_NUMBER_ID");
+    return;
+  }
+
   const url = `https://graph.facebook.com/${GRAPH_API_VERSION}/${PHONE_NUMBER_ID}/messages`;
 
   const body = {
@@ -22,7 +26,7 @@ async function sendTextMessage(to, text) {
     text: { body: text },
   };
 
-  const resp = await fetch(url, {
+  const r = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${WHATSAPP_TOKEN}`,
@@ -31,110 +35,65 @@ async function sendTextMessage(to, text) {
     body: JSON.stringify(body),
   });
 
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    console.error("sendTextMessage error:", resp.status, data);
-  }
-  return { ok: resp.ok, status: resp.status, data };
-}
-
-function getIncomingMessageText(body) {
-  // Padrão: entry[0].changes[0].value.messages[0].text.body
-  try {
-    const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg) return null;
-
-    if (msg.type === "text") return msg.text?.body || null;
-
-    // Se quiser expandir depois (audio, image etc.), faz aqui.
-    return null;
-  } catch {
-    return null;
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.log("❌ WhatsApp send error:", r.status, data);
+  } else {
+    console.log("✅ WhatsApp sent:", data);
   }
 }
 
-function getSenderWaId(body) {
-  try {
-    const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    return msg?.from || null; // wa_id do usuário
-  } catch {
-    return null;
-  }
-}
-
-function isEchoFromUs(body) {
-  // Evita responder a mensagens "echo" (enviadas por você)
-  // Nem sempre vem, mas quando vem ajuda.
-  try {
-    const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    return Boolean(msg?.context?.from); // heurística leve
-  } catch {
-    return false;
-  }
-}
-
-async function openaiReply(userText) {
+async function getAIReply(userText) {
+  // Se não tiver OpenAI key, cai num fallback simples (pra não travar o bot)
   if (!OPENAI_API_KEY) {
-    return "Estou com instabilidade no sistema agora. Pode tentar novamente em instantes?";
+    return "Oi! 😊 Me diga: é implante, estética em resina, limpeza ou clareamento?";
   }
 
-  const systemPrompt = `
-Você é um assistente premium de atendimento de uma clínica odontológica no WhatsApp.
-Objetivo: converter leads (vindos de anúncios do Instagram/Facebook) em agendamento de avaliação.
-
-Serviços: Implantes, estética em resina, limpeza, clareamento, aparelho, dor/urgência (triagem), outros.
-
-Tom: humano, brasileiro, acolhedor e direto. Mensagens curtas. No máximo 1 emoji por mensagem. Faça UMA pergunta por vez.
-
+  const system = `
+Você é um atendente premium de clínica odontológica no WhatsApp.
+Objetivo: acolher e conduzir o lead para agendar uma avaliação (sem pressionar).
 Regras:
-- Não diagnosticar nem prescrever medicamentos.
-- Se urgência (dor insuportável, sangramento intenso, inchaço no rosto, febre, trauma forte, pus): orientar atendimento imediato e oferecer contato humano.
-- Se pedir preço fechado: dizer que depende do caso e que a avaliação define o orçamento.
-- Sempre buscar: nome + qual serviço + preferencia de dia/turno para agendar.
-  `.trim();
+- Mensagens curtas.
+- Uma pergunta por vez.
+- Não diagnosticar nem prescrever medicamento.
+- Se for urgência (dor insuportável, sangramento forte, febre, inchaço no rosto, pus): orientar procura imediata e oferecer encaminhar para humano.
+- Se a pessoa já falar "implante", assuma implante e faça 2-3 perguntas rápidas (ex.: tempo sem dente, dor, região) e puxe para agendamento.
+Tom: humano, brasileiro, acolhedor.
+`;
 
-  // Chamando OpenAI (Responses API)
-  const resp = await fetch("https://api.openai.com/v1/responses", {
+  const payload = {
+    model: OPENAI_MODEL,
+    messages: [
+      { role: "system", content: system.trim() },
+      { role: "user", content: userText },
+    ],
+    temperature: 0.4,
+  };
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      input: [
-        {
-          role: "system",
-          content: systemPrompt,
-        },
-        {
-          role: "user",
-          content: userText,
-        },
-      ],
-    }),
+    body: JSON.stringify(payload),
   });
 
-  const data = await resp.json().catch(() => ({}));
-
-  if (!resp.ok) {
-    console.error("OpenAI error:", resp.status, data);
-    return "Tive um probleminha aqui pra responder agora. Pode repetir sua mensagem em 1 minuto?";
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.log("❌ OpenAI error:", r.status, data);
+    return "Oi! 😊 Me diga: é implante, estética em resina, limpeza ou clareamento?";
   }
 
-  // Resposta vem em data.output_text na maioria dos casos
-  const text = data.output_text || data?.output?.[0]?.content?.[0]?.text || "";
-  return (text || "").trim() || "Perfeito. Qual seu nome, por favor?";
+  const text = data?.choices?.[0]?.message?.content?.trim();
+  return text || "Oi! 😊 Me diga: é implante, estética em resina, limpeza ou clareamento?";
 }
 
-// =========================
-// Handler (Vercel)
-// =========================
+// ======= handler =======
+
 export default async function handler(req, res) {
   try {
-    // --------
-    // GET: verificação do webhook (Meta)
-    // --------
+    // --- Verificação do webhook (Meta) ---
     if (req.method === "GET") {
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
@@ -146,37 +105,53 @@ export default async function handler(req, res) {
       return res.status(403).send("Forbidden");
     }
 
-    // --------
-    // POST: eventos (mensagens)
-    // --------
+    // --- Recebendo mensagens (POST) ---
     if (req.method === "POST") {
       const body = req.body;
 
-      // Responder rápido para a Meta (boa prática)
-      res.status(200).json({ ok: true });
+      // Segurança: se não for evento do WhatsApp, só responde ok
+      if (!body?.entry?.length) {
+        return res.status(200).json({ ok: true });
+      }
 
-      // Ignora se não for mensagem
-      const incomingText = getIncomingMessageText(body);
-      const from = getSenderWaId(body);
+      const change = body.entry?.[0]?.changes?.[0];
+      const value = change?.value;
 
-      if (!incomingText || !from) return;
+      // Ignora status de entrega/leitura
+      if (value?.statuses?.length) {
+        return res.status(200).json({ ok: true });
+      }
 
-      // Evita loop / echo
-      if (isEchoFromUs(body)) return;
+      const msg = value?.messages?.[0];
+      if (!msg) {
+        return res.status(200).json({ ok: true });
+      }
 
-      // Se quiser um “fallback” quando começar:
-      // if (incomingText.toLowerCase().includes("oi")) ...
+      const from = msg.from; // wa_id do usuário
+      let userText = "";
 
-      const aiText = await openaiReply(incomingText);
+      if (msg.type === "text") {
+        userText = msg.text?.body || "";
+      } else {
+        // por enquanto: se mandar áudio/foto etc, responde pedindo texto
+        await sendTextMessage(from, "Consigo te ajudar! 🙂 Por enquanto me manda em texto o que você precisa (implante, resina, limpeza, clareamento).");
+        return res.status(200).json({ ok: true });
+      }
 
-      // Envia resposta no WhatsApp
-      await sendTextMessage(from, aiText);
-      return;
+      console.log("📩 Incoming:", { from, userText });
+
+      // Resposta (IA ou fallback)
+      const reply = await getAIReply(userText);
+
+      // Envia no WhatsApp
+      await sendTextMessage(from, reply);
+
+      return res.status(200).json({ ok: true });
     }
 
     return res.status(405).send("Method Not Allowed");
   } catch (err) {
-    console.error("Handler error:", err);
-    return res.status(500).send("Internal Server Error");
+    console.log("❌ Handler error:", err);
+    return res.status(200).json({ ok: true });
   }
 }
