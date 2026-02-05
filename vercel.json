@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/webhook.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
+}
