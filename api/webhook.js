@@ -1,5 +1,5 @@
 // /api/webhook.js
-// WhatsApp Cloud API (Vercel) + Mentor (OpenAI) + Calculadora + Áudio + Redis (REDIS_URL)
+// WhatsApp Cloud API (Vercel) + Mentor (OpenAI) + Calculadora + Áudio + Imagem + Redis (REDIS_URL)
 
 import { createClient } from "redis";
 
@@ -47,11 +47,11 @@ function sleep(ms) {
 
 function humanDelayMs(text) {
   const len = (text || "").length;
-  const base = 700;
-  const perChar = 8;
+  const base = 650;
+  const perChar = 7;
   const jitter = Math.floor(Math.random() * 600);
   const ms = base + len * perChar + jitter;
-  return Math.min(4500, Math.max(550, ms));
+  return Math.min(4200, Math.max(520, ms));
 }
 
 function splitMessageSmart(text, maxParts = 6) {
@@ -192,6 +192,9 @@ async function ensureSession(from) {
         calc: null,
         pendingLong: null,
         pendingCalcConfirm: false,
+
+        // imagem (opção 2): guarda a mídia até o aluno dizer o que quer analisar
+        pendingImage: null, // { mediaId, caption, ts }
       },
       _lastTs: Date.now(),
     };
@@ -223,7 +226,7 @@ ${prompt}`;
 }
 
 /* =========================
-   Detector de intenção da calculadora
+   Detector de intenção da calculadora / respostas
    ========================= */
 function normalizeLoose(s) {
   return (s || "")
@@ -273,6 +276,11 @@ function isYes(text) {
 function isNo(text) {
   const s = normalizeLoose(text);
   return ["2", "nao", "não", "n", "agora nao", "agora não", "depois", "não quero"].includes(s);
+}
+
+function isCancel(text) {
+  const s = normalizeLoose(text);
+  return ["cancelar", "cancela", "deixa", "deixa pra la", "deixa pra lá", "nao", "não", "para", "pare"].includes(s);
 }
 
 /* =========================
@@ -500,7 +508,8 @@ function looksLikePlanRequest(t) {
 }
 
 /* =========================
-   ÁUDIO: WhatsApp -> baixar mídia -> transcrever (OpenAI)
+   WhatsApp Media: meta + download
+   (serve pra áudio e imagem)
    ========================= */
 async function getWhatsAppMediaMeta(mediaId, trace) {
   const url = `https://graph.facebook.com/v22.0/${mediaId}`;
@@ -518,7 +527,7 @@ async function getWhatsAppMediaMeta(mediaId, trace) {
     console.log("❌ Media meta error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
     return null;
   }
-  return data; // { url, mime_type, ... }
+  return data; // { url, mime_type, file_size, ... }
 }
 
 async function downloadWhatsAppMediaFile(mediaUrl, trace) {
@@ -541,6 +550,9 @@ async function downloadWhatsAppMediaFile(mediaUrl, trace) {
   return { arrayBuffer, contentType };
 }
 
+/* =========================
+   ÁUDIO -> transcrição (OpenAI)
+   ========================= */
 async function transcribeWithOpenAI({ arrayBuffer, contentType, trace }) {
   const model = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
 
@@ -586,7 +598,82 @@ async function transcribeWhatsAppAudio({ mediaId, trace }) {
 }
 
 /* =========================
-   AGENTE MENTOR (OpenAI)
+   IMAGEM -> análise (OpenAI Vision)
+   ========================= */
+function arrayBufferToBase64(ab) {
+  return Buffer.from(ab).toString("base64");
+}
+
+async function analyzeImageWithOpenAI({ imageArrayBuffer, mimeType, userRequest, caption, history, trace }) {
+  // model que suporta visão
+  const model = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  const spTime = nowInSaoPaulo();
+
+  const system = `
+Você é o Assistente Oficial da UNIVERSIDADE DA RESINA, do professor Matheus.
+Você é mentor técnico + amigo no WhatsApp: direto, prático, sem enrolar (0–2 emojis).
+
+VOCÊ VAI ANALISAR UMA IMAGEM enviada por um aluno (peça com resina/ madeira / molde / acabamento).
+Regras:
+- NÃO invente detalhes que não dá pra ver.
+- Se algo estiver incerto pela imagem, diga o que você precisa que o aluno confirme.
+- Foque em: bolhas, cura/pegajosidade, marcas de lixamento, contaminação/poeira, selagem, nivelamento, vazamento/moldes.
+- Entregue: (1) diagnóstico provável, (2) causa mais provável, (3) passo a passo do que fazer agora, (4) prevenção no próximo projeto.
+- Termine com 1 pergunta objetiva (ex: “Qual resina você usou: baixa/média/alta? e qual espessura?”)
+
+Horário (SP): ${spTime}
+`.trim();
+
+  const b64 = arrayBufferToBase64(imageArrayBuffer);
+  const dataUrl = `data:${mimeType};base64,${b64}`;
+
+  const contextText = [
+    caption ? `Legenda da foto (caption): ${caption}` : null,
+    userRequest ? `Pedido do aluno: ${userRequest}` : null,
+  ].filter(Boolean).join("\n");
+
+  const payload = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      ...(history || []),
+      {
+        role: "user",
+        content: [
+          { type: "text", text: contextText || "Analise a foto da peça e me oriente." },
+          { type: "image_url", image_url: { url: dataUrl } },
+        ],
+      },
+    ],
+    temperature: 0.45,
+  };
+
+  const r = await fetchWithTimeout(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+    25000
+  );
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.log("❌ OpenAI vision error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
+    return "Deu um erro na hora de analisar a imagem 😅 Pode mandar a foto de novo (mais perto/mais luz) e me dizer o que você quer que eu avalie nela?";
+  }
+
+  return data?.choices?.[0]?.message?.content?.trim()
+    || "Recebi a imagem. Me diz em 1 frase o que você quer que eu avalie nela (bolhas, cura, acabamento, molde, etc.).";
+}
+
+/* =========================
+   AGENTE MENTOR (texto)
    ========================= */
 async function getAIReply({ history, userText, trace }) {
   const spTime = nowInSaoPaulo();
@@ -638,7 +725,7 @@ Horário (SP): ${spTime}
 
   const payload = {
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    messages: [{ role: "system", content: system }, ...history, { role: "user", content: userText }],
+    messages: [{ role: "system", content: system }, ...(history || []), { role: "user", content: userText }],
     temperature: 0.55,
   };
 
@@ -703,7 +790,43 @@ export default async function handler(req, res) {
     // sessão persistente
     const sess = await ensureSession(from);
 
-    // Captura texto (ou transcreve áudio)
+    /* =========================
+       1) Se chegou IMAGEM: pedir confirmação (opção 2)
+       ========================= */
+    if (msg.type === "image") {
+      const mediaId = msg.image?.id;
+      const caption = msg.image?.caption || "";
+
+      if (!mediaId) {
+        const quick = "Recebi uma imagem, mas não consegui puxar o arquivo 😅 Pode mandar de novo?";
+        await sleep(humanDelayMs(quick));
+        await sendWhatsAppText({ to: from, bodyText: quick, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      // guarda pra próxima mensagem do aluno
+      sess.state.pendingImage = { mediaId, caption: caption || "", ts: Date.now() };
+      await kvSetSession(from, sess);
+
+      const ask =
+`📸 Foto recebida!
+Me diz em uma frase o que você quer que eu avalie nela.
+
+Exemplos:
+- “tá dando bolhas, por quê?”
+- “ficou pegajoso”
+- “marcas no lixamento”
+- “deu vazamento no molde”
+- “como melhorar o acabamento?”`;
+
+      await sleep(humanDelayMs(ask));
+      await sendWhatsAppText({ to: from, bodyText: ask, trace });
+      return res.status(200).json({ ok: true });
+    }
+
+    /* =========================
+       2) Captura texto (ou transcreve áudio)
+       ========================= */
     let userText = "";
 
     if (msg.type === "text") {
@@ -732,17 +855,102 @@ export default async function handler(req, res) {
       }
 
       userText = transcript.trim();
+
       // evita inflar histórico
-      sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText.slice(0, 1200)}` });
+      sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText.slice(0, 900)}` });
       if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
     } else {
-      const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou manda um áudio).";
+      const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou manda um áudio / foto).";
       await sleep(humanDelayMs(quick));
       await sendWhatsAppText({ to: from, bodyText: quick, trace });
       return res.status(200).json({ ok: true });
     }
 
-    // reset
+    /* =========================
+       3) Se tem IMAGEM pendente e agora chegou o “pedido livre” -> analisar
+       ========================= */
+    if (sess.state.pendingImage?.mediaId) {
+      if (isCancel(userText)) {
+        sess.state.pendingImage = null;
+        await kvSetSession(from, sess);
+
+        const ok = "Fechado 🙂 Se quiser, manda outra foto depois e me diz o que você quer avaliar.";
+        await sleep(humanDelayMs(ok));
+        await sendWhatsAppText({ to: from, bodyText: ok, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      const { mediaId, caption } = sess.state.pendingImage;
+
+      const ack = "Boa — tô analisando a foto agora 📸";
+      await sleep(humanDelayMs(ack));
+      await sendWhatsAppText({ to: from, bodyText: ack, trace });
+
+      const meta = await getWhatsAppMediaMeta(mediaId, trace);
+      if (!meta?.url) {
+        sess.state.pendingImage = null;
+        await kvSetSession(from, sess);
+
+        const fail = "Não consegui baixar essa foto 😅 Pode reenviar (de preferência com boa luz) e me dizer o que avaliar?";
+        await sleep(humanDelayMs(fail));
+        await sendWhatsAppText({ to: from, bodyText: fail, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      // proteção simples contra arquivos gigantes
+      if (meta.file_size && Number(meta.file_size) > 6_000_000) {
+        sess.state.pendingImage = null;
+        await kvSetSession(from, sess);
+
+        const big =
+          "Essa foto veio bem pesada 😅 Se puder, manda de novo em resolução menor (ou como ‘foto’ normal, não ‘documento’) que eu analiso certinho.";
+        await sleep(humanDelayMs(big));
+        await sendWhatsAppText({ to: from, bodyText: big, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      const file = await downloadWhatsAppMediaFile(meta.url, trace);
+      if (!file?.arrayBuffer) {
+        sess.state.pendingImage = null;
+        await kvSetSession(from, sess);
+
+        const fail = "Não consegui baixar essa foto 😅 Pode reenviar com boa luz e mais perto da peça?";
+        await sleep(humanDelayMs(fail));
+        await sendWhatsAppText({ to: from, bodyText: fail, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      const analysis = await analyzeImageWithOpenAI({
+        imageArrayBuffer: file.arrayBuffer,
+        mimeType: meta.mime_type || file.contentType || "image/jpeg",
+        userRequest: userText,
+        caption,
+        history: sess.history,
+        trace,
+      });
+
+      // limpa pendência
+      sess.state.pendingImage = null;
+
+      // salva histórico curto (pra manter contexto sem explodir Redis)
+      sess.history.push({ role: "user", content: `🖼️ (imagem) ${userText.slice(0, 300)}` });
+      sess.history.push({ role: "assistant", content: analysis.slice(0, 900) });
+      if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
+
+      await kvSetSession(from, sess);
+
+      const parts = splitMessageSmart(analysis, 6);
+      for (const part of parts) {
+        await sleep(humanDelayMs(part));
+        await sendWhatsAppText({ to: from, bodyText: part, trace });
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    /* =========================
+       comandos
+       ========================= */
     if (normalizeLoose(userText) === "#reset") {
       await kvDelSession(from);
       const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
@@ -751,7 +959,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // debug calc
     if (normalizeLoose(userText) === "#calc") {
       sess.state.mode = "calc";
       sess.state.calc = { shape: null, kit: null, inlineTried: false };
@@ -765,7 +972,9 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Continuação de plano em partes
+    /* =========================
+       pendência de plano em partes
+       ========================= */
     if (sess.state.pendingLong && isContinueText(userText)) {
       const p = sess.state.pendingLong.parts;
       const next = p.splice(0, 2);
@@ -785,7 +994,9 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Oferta calculadora
+    /* =========================
+       Oferta da calculadora
+       ========================= */
     if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
       sess.state.pendingCalcConfirm = true;
 
@@ -802,7 +1013,6 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
       return res.status(200).json({ ok: true });
     }
 
-    // Confirmação calculadora
     if (sess.state.pendingCalcConfirm) {
       if (isYes(userText)) {
         sess.state.pendingCalcConfirm = false;
@@ -836,7 +1046,6 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
     if (sess.state.mode === "calc" && sess.state.calc) {
       const calc = sess.state.calc;
 
-      // escolher shape
       if (!calc.shape) {
         const n = userText.trim();
         if (n === "1") calc.shape = "retangulo";
@@ -870,7 +1079,6 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         return true;
       };
 
-      // Retângulo: tentar inline antes
       if (calc.shape === "retangulo" && !calc.inlineTried) {
         calc.inlineTried = true;
 
@@ -991,15 +1199,13 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
     }
 
     /* =========================
-       MODO MENTOR
+       MODO MENTOR (texto)
        ========================= */
     const replyText = await getAIReply({ history: sess.history, userText, trace });
 
-    // salva histórico (se não foi áudio, ainda não salvou o userText)
-    if (msg.type !== "audio") {
-      sess.history.push({ role: "user", content: userText });
-    }
-    sess.history.push({ role: "assistant", content: replyText });
+    // salva histórico (reduzido pra economizar Redis)
+    sess.history.push({ role: "user", content: userText.slice(0, 700) });
+    sess.history.push({ role: "assistant", content: replyText.slice(0, 900) });
     if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
 
     const parts = splitMessageSmart(replyText, 6);
