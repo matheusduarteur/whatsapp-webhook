@@ -20,6 +20,16 @@ function seenRecently(msgId, ttlMs = 10 * 60 * 1000) {
   return false;
 }
 
+// Limpa sessões antigas (pra não crescer infinito no serverless quente)
+function cleanupSessions(ttlMs = 6 * 60 * 60 * 1000) {
+  // Guarda timestamp dentro do array da sessão com uma propriedade interna
+  const now = Date.now();
+  for (const [k, v] of sessions.entries()) {
+    const last = v?._lastTs || 0;
+    if (last && now - last > ttlMs) sessions.delete(k);
+  }
+}
+
 function nowInSaoPaulo() {
   const fmt = new Intl.DateTimeFormat("pt-BR", {
     timeZone: "America/Sao_Paulo",
@@ -171,8 +181,15 @@ CONTEXTO
     return "Entendi. Me diz só: é implante, estética em resina, clareamento ou dor?";
   }
 
-  const reply = data?.choices?.[0]?.message?.content?.trim();
-  return reply || "Entendi. Me diz só: é implante, estética em resina, clareamento ou dor?";
+  let reply = data?.choices?.[0]?.message?.content?.trim() || "";
+  if (!reply) reply = "Entendi. Me diz só: é implante, estética em resina, clareamento ou dor?";
+
+  // proteção: não mandar textão gigante
+  if (reply.length > 1200) {
+    reply = reply.slice(0, 1150).trim() + "…\n\nMe diz: prefere manhã, tarde ou noite para agendar uma avaliação?";
+  }
+
+  return reply;
 }
 
 export default async function handler(req, res) {
@@ -210,6 +227,10 @@ export default async function handler(req, res) {
     const msgId = msg.id;
     const trace = `${from}:${msgId || "noid"}`;
 
+    // limpeza periódica dos Maps (barato e evita crescer)
+    cleanupMap(processed, 10 * 60 * 1000);
+    cleanupSessions();
+
     if (seenRecently(msgId)) {
       console.log("🔁 Duplicate ignored:", { trace });
       return res.status(200).json({ ok: true });
@@ -226,11 +247,16 @@ export default async function handler(req, res) {
     }
 
     const userText = msg.text?.body?.trim() || "";
+    if (!userText) return res.status(200).json({ ok: true });
+
     console.log("📩 Incoming:", { trace, userText });
 
     // Sessão por número
     if (!sessions.has(from)) sessions.set(from, []);
     const history = sessions.get(from);
+
+    // marca “última atividade” pra cleanupSessions
+    history._lastTs = Date.now();
 
     // Reset manual (pra teste)
     if (userText.toLowerCase() === "#reset") {
@@ -241,21 +267,26 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
+    // Mede tempo da OpenAI (se ela já demorou, não faz delay grande depois)
+    const t0 = Date.now();
     const replyText = await getAIReply({ history, userText, trace });
+    const aiMs = Date.now() - t0;
 
     // Salva histórico (limita)
     history.push({ role: "user", content: userText });
     history.push({ role: "assistant", content: replyText });
     if (history.length > 18) history.splice(0, history.length - 18);
 
-    // Envio com delay humano (em 1 ou 2 partes)
     const parts = splitMessage(replyText);
 
-    await sleep(humanDelayMs(parts[0]));
+    // Se a OpenAI já demorou muito, reduz delay pra não parecer travado
+    const d1 = aiMs > 8000 ? 0 : humanDelayMs(parts[0]);
+    await sleep(d1);
     await sendWhatsAppText({ to: from, bodyText: parts[0], trace });
 
     if (parts[1]) {
-      await sleep(700 + Math.floor(Math.random() * 900));
+      const d2 = aiMs > 8000 ? 250 : 700 + Math.floor(Math.random() * 900);
+      await sleep(d2);
       await sendWhatsAppText({ to: from, bodyText: parts[1], trace });
     }
 
