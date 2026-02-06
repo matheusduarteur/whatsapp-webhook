@@ -1,4 +1,5 @@
 // /api/webhook.js
+// ✅ WhatsApp Cloud API webhook (Vercel) + Mentor (OpenAI) + Calculadora + Áudio (transcrição)
 
 const sessions = new Map(); // from -> { history: [], state: {...}, _lastTs }
 const processed = new Map(); // msgId -> timestamp
@@ -159,7 +160,7 @@ function ensureSession(from) {
 }
 
 /* =========================
-   NOVO: feedback de input inválido (evita “silêncio”/travamento)
+   Feedback de input inválido (evita “silêncio”/travamento)
    ========================= */
 async function sendCalcInvalid({ to, trace, msg, prompt }) {
   const text =
@@ -458,6 +459,105 @@ function looksLikePlanRequest(t) {
 }
 
 /* =========================
+   ✅ ÁUDIO: WhatsApp -> baixar mídia -> transcrever (OpenAI) -> virar texto
+   ========================= */
+async function getWhatsAppMediaMeta(mediaId, trace) {
+  const url = `https://graph.facebook.com/v22.0/${mediaId}`;
+  const r = await fetchWithTimeout(
+    url,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` },
+    },
+    12000
+  );
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.log("❌ Media meta error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
+    return null;
+  }
+  // esperado: { url, mime_type, sha256, file_size, id }
+  return data;
+}
+
+async function downloadWhatsAppMediaFile(mediaUrl, trace) {
+  const r = await fetchWithTimeout(
+    mediaUrl,
+    {
+      method: "GET",
+      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` },
+    },
+    20000
+  );
+
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.log("❌ Media download error:", { trace, status: r.status, body: t.slice(0, 500) });
+    return null;
+  }
+  const arrayBuffer = await r.arrayBuffer();
+  const contentType = r.headers.get("content-type") || "application/octet-stream";
+  return { arrayBuffer, contentType };
+}
+
+async function transcribeWithOpenAI({ arrayBuffer, contentType, trace }) {
+  // Modelo de transcrição (padrão: whisper-1)
+  const model = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
+
+  const form = new FormData();
+  const blob = new Blob([arrayBuffer], { type: contentType });
+
+  // filename ajuda a API a aceitar melhor
+  const filename = contentType.includes("ogg") ? "audio.ogg" : "audio.bin";
+
+  form.append("model", model);
+  form.append("file", blob, filename);
+  // form.append("language", "pt"); // opcional (se quiser travar pt)
+
+  const r = await fetchWithTimeout(
+    "https://api.openai.com/v1/audio/transcriptions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: form,
+    },
+    25000
+  );
+
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    console.log("❌ OpenAI transcription error:", {
+      trace,
+      status: r.status,
+      data: JSON.stringify(data).slice(0, 900),
+    });
+    return null;
+  }
+
+  const text = (data?.text || "").trim();
+  return text || null;
+}
+
+async function transcribeWhatsAppAudio({ mediaId, trace }) {
+  const meta = await getWhatsAppMediaMeta(mediaId, trace);
+  if (!meta?.url) return null;
+
+  const file = await downloadWhatsAppMediaFile(meta.url, trace);
+  if (!file?.arrayBuffer) return null;
+
+  const transcript = await transcribeWithOpenAI({
+    arrayBuffer: file.arrayBuffer,
+    contentType: meta.mime_type || file.contentType,
+    trace,
+  });
+
+  return transcript;
+}
+
+/* =========================
    AGENTE MENTOR (OpenAI)
    ========================= */
 async function getAIReply({ history, userText, trace }) {
@@ -580,22 +680,10 @@ export default async function handler(req, res) {
 
     if (msg.type === "sticker") return res.status(200).json({ ok: true });
 
-    // ✅ já prepara terreno pro áudio no futuro:
-    // por enquanto, qualquer coisa que não seja texto responde pedindo texto.
-    if (msg.type !== "text") {
-      const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou diz ‘quero calcular’ pra usar a calculadora).";
-      await sleep(humanDelayMs(quick));
-      await sendWhatsAppText({ to: from, bodyText: quick, trace });
-      return res.status(200).json({ ok: true });
-    }
-
-    const userText = msg.text?.body?.trim() || "";
-    if (!userText) return res.status(200).json({ ok: true });
-
     const sess = ensureSession(from);
 
     // comando de reset
-    if (userText.toLowerCase() === "#reset") {
+    if (msg.type === "text" && (msg.text?.body || "").trim().toLowerCase() === "#reset") {
       sessions.delete(from);
       const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
       await sleep(humanDelayMs(ok));
@@ -604,13 +692,56 @@ export default async function handler(req, res) {
     }
 
     // manter #calc pra debug/teste
-    if (userText.toLowerCase() === "#calc") {
+    if (msg.type === "text" && (msg.text?.body || "").trim().toLowerCase() === "#calc") {
       sess.state.mode = "calc";
       sess.state.calc = { shape: null, kit: null, inlineTried: false };
       sess.state.pendingCalcConfirm = false;
       const prompt = calcNextPrompt(sess.state.calc);
       await sleep(humanDelayMs(prompt));
       await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+      return res.status(200).json({ ok: true });
+    }
+
+    // =========
+    // ✅ Captura texto do usuário (se vier por áudio, transcreve)
+    // =========
+    let userText = "";
+
+    if (msg.type === "text") {
+      userText = msg.text?.body?.trim() || "";
+      if (!userText) return res.status(200).json({ ok: true });
+    } else if (msg.type === "audio") {
+      // WhatsApp voice note / audio
+      const mediaId = msg.audio?.id;
+      if (!mediaId) {
+        const quick = "Não consegui acessar esse áudio 😅 Me manda em texto rapidinho?";
+        await sleep(humanDelayMs(quick));
+        await sendWhatsAppText({ to: from, bodyText: quick, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      const ack = "Tô ouvindo teu áudio aqui… 🎧";
+      await sleep(humanDelayMs(ack));
+      await sendWhatsAppText({ to: from, bodyText: ack, trace });
+
+      const transcript = await transcribeWhatsAppAudio({ mediaId, trace });
+      if (!transcript) {
+        const fail = "Deu ruim pra transcrever esse áudio 😅 Pode mandar de novo (mais pertinho do microfone) ou escrever em texto?";
+        await sleep(humanDelayMs(fail));
+        await sendWhatsAppText({ to: from, bodyText: fail, trace });
+        return res.status(200).json({ ok: true });
+      }
+
+      userText = transcript.trim();
+
+      // opcional: guardar no histórico com marca de áudio
+      sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText}` });
+      if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
+    } else {
+      // outros tipos (imagem, documento, etc.)
+      const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou manda um áudio).";
+      await sleep(humanDelayMs(quick));
+      await sendWhatsAppText({ to: from, bodyText: quick, trace });
       return res.status(200).json({ ok: true });
     }
 
@@ -718,7 +849,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
           calc.l_cm = inline.l_cm;
           calc.a_cm = inline.a_cm;
 
-          // ✅ NOVO: se mandar o kit junto no mesmo texto, captura também
+          // se mandar o kit junto no mesmo texto, captura também
           const kitInline = parseKitWeights(userText);
           if (kitInline) calc.kit = kitInline;
         } else {
@@ -829,14 +960,15 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
        ========================= */
     const replyText = await getAIReply({ history: sess.history, userText, trace });
 
-    // salva histórico
-    sess.history.push({ role: "user", content: userText });
+    // salva histórico (se não foi áudio já pré-salvo)
+    if (!(msg.type === "audio")) {
+      sess.history.push({ role: "user", content: userText });
+    }
     sess.history.push({ role: "assistant", content: replyText });
     if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
 
     const parts = splitMessageSmart(replyText, 6);
 
-    // ✅ NOVO: se for muito grande, também ativa “modo partes” mesmo sem palavra “plano”
     const shouldChunkLong =
       looksLikePlanRequest(userText) ||
       (replyText && replyText.length > 1600);
