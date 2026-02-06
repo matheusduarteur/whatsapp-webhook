@@ -22,7 +22,6 @@ function seenRecently(msgId, ttlMs = 10 * 60 * 1000) {
 
 // Limpa sessões antigas (pra não crescer infinito no serverless quente)
 function cleanupSessions(ttlMs = 6 * 60 * 60 * 1000) {
-  // Guarda timestamp dentro do array da sessão com uma propriedade interna
   const now = Date.now();
   for (const [k, v] of sessions.entries()) {
     const last = v?._lastTs || 0;
@@ -183,11 +182,7 @@ CONTEXTO
 
   let reply = data?.choices?.[0]?.message?.content?.trim() || "";
   if (!reply) reply = "Entendi. Me diz só: é implante, estética em resina, clareamento ou dor?";
-
-  // proteção: não mandar textão gigante
-  if (reply.length > 1200) {
-    reply = reply.slice(0, 1150).trim() + "…\n\nMe diz: prefere manhã, tarde ou noite para agendar uma avaliação?";
-  }
+  if (reply.length > 1200) reply = reply.slice(0, 1150).trim() + "…";
 
   return reply;
 }
@@ -210,7 +205,6 @@ export default async function handler(req, res) {
   try {
     assertEnv();
 
-    // Em alguns setups, req.body pode vir como string
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
     const entry = body?.entry?.[0];
@@ -227,7 +221,6 @@ export default async function handler(req, res) {
     const msgId = msg.id;
     const trace = `${from}:${msgId || "noid"}`;
 
-    // limpeza periódica dos Maps (barato e evita crescer)
     cleanupMap(processed, 10 * 60 * 1000);
     cleanupSessions();
 
@@ -236,10 +229,16 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Só texto por enquanto
+    // ✅ IGNORA FIGURINHA (sticker)
+    if (msg.type === "sticker") {
+      console.log("🧷 Sticker ignored:", { trace });
+      return res.status(200).json({ ok: true });
+    }
+
+    // Outros tipos: pede texto (opcional)
     if (msg.type !== "text") {
       const quick =
-        "Consigo te ajudar 🙂 Por enquanto, me manda em texto o que você precisa (implante, resina, clareamento ou dor).";
+        "Consigo te ajudar 🙂 Me manda em texto o que você precisa (implante, resina, clareamento ou dor).";
       console.log("📩 Incoming non-text:", { trace, type: msg.type });
       await sleep(humanDelayMs(quick));
       await sendWhatsAppText({ to: from, bodyText: quick, trace });
@@ -251,14 +250,10 @@ export default async function handler(req, res) {
 
     console.log("📩 Incoming:", { trace, userText });
 
-    // Sessão por número
     if (!sessions.has(from)) sessions.set(from, []);
     const history = sessions.get(from);
-
-    // marca “última atividade” pra cleanupSessions
     history._lastTs = Date.now();
 
-    // Reset manual (pra teste)
     if (userText.toLowerCase() === "#reset") {
       sessions.delete(from);
       const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
@@ -267,19 +262,16 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // Mede tempo da OpenAI (se ela já demorou, não faz delay grande depois)
     const t0 = Date.now();
     const replyText = await getAIReply({ history, userText, trace });
     const aiMs = Date.now() - t0;
 
-    // Salva histórico (limita)
     history.push({ role: "user", content: userText });
     history.push({ role: "assistant", content: replyText });
     if (history.length > 18) history.splice(0, history.length - 18);
 
     const parts = splitMessage(replyText);
 
-    // Se a OpenAI já demorou muito, reduz delay pra não parecer travado
     const d1 = aiMs > 8000 ? 0 : humanDelayMs(parts[0]);
     await sleep(d1);
     await sendWhatsAppText({ to: from, bodyText: parts[0], trace });
@@ -293,7 +285,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.log("❌ Handler error:", err);
-    // sempre 200 pra Meta não ficar retry infinito
     return res.status(200).json({ ok: true });
   }
 }
