@@ -97,11 +97,10 @@ function splitMessageSmart(text, maxParts = 6) {
       finalParts[finalParts.length - 1].trim() + "\n\n(Se quiser, eu continuo 🙂)";
   }
 
-  if (finalParts.length > 1) {
-    return finalParts.map((p, i) => `(${i + 1}/${finalParts.length})\n${p}`);
-  }
+  // ✅ SEM prefixo (1/3), (2/3)...
   return finalParts;
 }
+
 
 function assertEnv() {
   const needed = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "OPENAI_API_KEY", "REDIS_URL"];
