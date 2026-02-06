@@ -1,34 +1,52 @@
 const sessions = new Map();
 
+// Dedup (Meta pode reenviar evento)
+const processed = new Map(); // msgId -> timestamp
+
+function cleanupMap(map, ttlMs) {
+  const now = Date.now();
+  for (const [k, v] of map.entries()) {
+    if (now - v > ttlMs) map.delete(k);
+  }
+}
+
+function seenRecently(msgId, ttlMs = 10 * 60 * 1000) {
+  if (!msgId) return false;
+  cleanupMap(processed, ttlMs);
+  const now = Date.now();
+  const ts = processed.get(msgId);
+  if (ts && now - ts < ttlMs) return true;
+  processed.set(msgId, now);
+  return false;
+}
+
 function nowInSaoPaulo() {
   const fmt = new Intl.DateTimeFormat("pt-BR", {
     timeZone: "America/Sao_Paulo",
     hour: "2-digit",
     minute: "2-digit",
   });
-  return fmt.format(new Date()); // "09:43"
+  return fmt.format(new Date());
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Delay proporcional ao tamanho + jitter, com limites seguros
 function humanDelayMs(text) {
   const len = (text || "").length;
-  const base = 900;          // mínimo
-  const perChar = 14;        // ajuste fino (↑ mais lento / ↓ mais rápido)
-  const jitter = Math.floor(Math.random() * 700); // 0–700ms
+  const base = 900;
+  const perChar = 14;
+  const jitter = Math.floor(Math.random() * 700);
   const ms = base + len * perChar + jitter;
   return Math.min(5000, Math.max(1200, ms)); // 1.2s a 5s
 }
 
-// Divide mensagem longa em blocos "humanos"
 function splitMessage(text) {
   const t = (text || "").trim();
+  if (!t) return ["..."];
   if (t.length <= 320) return [t];
 
-  // quebra em até 2 partes para não virar spam
   const max1 = 320;
   let cut = t.lastIndexOf("\n", max1);
   if (cut < 120) cut = t.lastIndexOf(". ", max1);
@@ -37,41 +55,57 @@ function splitMessage(text) {
   const p1 = t.slice(0, cut).trim();
   const p2 = t.slice(cut).trim();
 
-  // se a 2ª parte ficar enorme, limita (pra não mandar 5 mensagens)
-  if (p2.length > 420) {
-    return [p1, p2.slice(0, 420).trim() + "…"];
-  }
-
+  if (p2.length > 420) return [p1, p2.slice(0, 420).trim() + "…"];
   return [p1, p2];
 }
 
-async function sendWhatsAppText(to, bodyText) {
+function assertEnv() {
+  const needed = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "OPENAI_API_KEY"];
+  const missing = needed.filter((k) => !process.env[k]);
+  if (missing.length) throw new Error("Missing env vars: " + missing.join(", "));
+}
+
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function sendWhatsAppText({ to, bodyText, trace }) {
   const url = `https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`;
 
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-      "Content-Type": "application/json",
+  const r = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to,
+        type: "text",
+        text: { body: bodyText },
+      }),
     },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: bodyText },
-    }),
-  });
+    12000
+  );
 
   const dataText = await r.text();
   if (!r.ok) {
-    console.log("❌ WhatsApp send error:", r.status, dataText);
+    console.log("❌ WhatsApp send error:", { trace, status: r.status, dataText: dataText.slice(0, 800) });
   } else {
-    console.log("✅ WhatsApp sent:", r.status);
+    console.log("✅ WhatsApp sent:", { trace, status: r.status });
   }
   return { ok: r.ok, status: r.status, dataText };
 }
 
-async function getAIReply(history, userText) {
+async function getAIReply({ history, userText, trace }) {
   const spTime = nowInSaoPaulo();
 
   const system = `
@@ -118,31 +152,36 @@ CONTEXTO
     temperature: 0.55,
   };
 
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+  const r = await fetchWithTimeout(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
     },
-    body: JSON.stringify(payload),
-  });
+    15000
+  );
 
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
-    console.log("❌ OpenAI error:", r.status, JSON.stringify(data).slice(0, 1000));
+    console.log("❌ OpenAI error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
     return "Entendi. Me diz só: é implante, estética em resina, clareamento ou dor?";
   }
 
   const reply = data?.choices?.[0]?.message?.content?.trim();
+  if (!reply) console.log("⚠️ Empty AI reply:", { trace });
   return reply || "Entendi. Me diz só: é implante, estética em resina, clareamento ou dor?";
 }
 
 export default async function handler(req, res) {
-  // ===== Webhook verify (Meta) =====
+  // ===== Verify (Meta) =====
   if (req.method === "GET") {
-    const mode = req.query["hub.mode"];
-    const token = req.query["hub.verify_token"];
-    const challenge = req.query["hub.challenge"];
+    const mode = req.query?.["hub.mode"];
+    const token = req.query?.["hub.verify_token"];
+    const challenge = req.query?.["hub.challenge"];
 
     if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
       return res.status(200).send(challenge);
@@ -150,69 +189,16 @@ export default async function handler(req, res) {
     return res.status(403).send("Forbidden");
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
-  }
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
 
   try {
+    assertEnv();
+
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
 
     // ignora status de entrega/leitura
-    if (value?.statuses?.length) {
-      return res.status(200).json({ ok: true });
-    }
+    if (value?.statuses?.length) return res.status(200).json({ ok: true });
 
-    const msg = value?.messages?.[0];
-    if (!msg) {
-      return res.status(200).json({ ok: true });
-    }
-
-    const from = msg.from;
-
-    // Só texto por enquanto (evita travar)
-    if (msg.type !== "text") {
-      const quick = "Consigo te ajudar 🙂 Por enquanto, me manda em texto o que você precisa (implante, resina, clareamento ou dor).";
-      await sleep(humanDelayMs(quick));
-      await sendWhatsAppText(from, quick);
-      return res.status(200).json({ ok: true });
-    }
-
-    const userText = msg.text?.body?.trim() || "";
-    console.log("📩 Incoming:", { from, userText });
-
-    // Sessão por número
-    if (!sessions.has(from)) sessions.set(from, []);
-    const history = sessions.get(from);
-
-    // Gera resposta IA (com histórico)
-    const replyText = await getAIReply(history, userText);
-
-    // Salva histórico (limitado pra não crescer infinito)
-    history.push({ role: "user", content: userText });
-    history.push({ role: "assistant", content: replyText });
-    if (history.length > 18) {
-      // mantém só os últimos 18 itens (9 trocas)
-      history.splice(0, history.length - 18);
-    }
-
-    // Delay humano antes de enviar
-    const parts = splitMessage(replyText);
-
-    // Parte 1
-    await sleep(humanDelayMs(parts[0]));
-    await sendWhatsAppText(from, parts[0]);
-
-    // Parte 2 (se existir) com mini-delay extra
-    if (parts[1]) {
-      await sleep(700 + Math.floor(Math.random() * 900));
-      await sendWhatsAppText(from, parts[1]);
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.log("❌ Handler error:", err);
-    return res.status(200).json({ ok: true });
-  }
-}
+    const msg =
