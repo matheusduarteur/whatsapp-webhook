@@ -1,3 +1,5 @@
+// /api/webhook.js
+
 const sessions = new Map(); // from -> { history: [], state: {...}, _lastTs }
 const processed = new Map(); // msgId -> timestamp
 
@@ -157,6 +159,27 @@ function ensureSession(from) {
 }
 
 /* =========================
+   NOVO: feedback de input inválido (evita “silêncio”/travamento)
+   ========================= */
+async function sendCalcInvalid({ to, trace, msg, prompt }) {
+  const text =
+`${msg}
+
+📌 Exemplos válidos:
+- 30cm
+- 0,8m
+- 5mm
+- 30x10x0,5cm
+
+${prompt}`;
+  const parts = splitMessageSmart(text, 4);
+  for (const p of parts) {
+    await sleep(humanDelayMs(p));
+    await sendWhatsAppText({ to, bodyText: p, trace });
+  }
+}
+
+/* =========================
    Detector de intenção da calculadora
    ========================= */
 function normalizeLoose(s) {
@@ -165,13 +188,12 @@ function normalizeLoose(s) {
     .trim()
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // tira acentos
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 function isCalcIntent(text) {
   const s = normalizeLoose(text);
 
-  // palavras/expressões típicas de pedido de cálculo
   const keywords = [
     "calculadora",
     "calc",
@@ -194,9 +216,7 @@ function isCalcIntent(text) {
     "ml",
   ];
 
-  // se tiver "x" com números tipo 30x10x0,5cm também é intenção forte
   const hasDimsInline = /(\d+([.,]\d+)?x){2}\d+([.,]\d+)?(mm|cm|m)?\b/i.test(text);
-
   if (hasDimsInline) return true;
 
   return keywords.some((k) => s.includes(normalizeLoose(k)));
@@ -227,7 +247,7 @@ function parseLengthToCm(input) {
   const unit = (m[3] || "cm").toLowerCase();
   if (unit === "m") return val * 100;
   if (unit === "mm") return val / 10;
-  return val; // cm
+  return val;
 }
 
 function parseWeightToG(input) {
@@ -262,7 +282,6 @@ function parseDims3Inline(text) {
   if (unitMatch) unit = unitMatch[1];
 
   const core = unit ? t.slice(0, -unit.length) : t;
-
   const parts = core.split("x").filter(Boolean);
   if (parts.length !== 3) return null;
 
@@ -275,7 +294,7 @@ function parseDims3Inline(text) {
   const toCm = (val) => {
     if (unit === "m") return val * 100;
     if (unit === "mm") return val / 10;
-    return val; // default cm
+    return val;
   };
 
   return { c_cm: toCm(nums[0]), l_cm: toCm(nums[1]), a_cm: toCm(nums[2]) };
@@ -561,6 +580,8 @@ export default async function handler(req, res) {
 
     if (msg.type === "sticker") return res.status(200).json({ ok: true });
 
+    // ✅ já prepara terreno pro áudio no futuro:
+    // por enquanto, qualquer coisa que não seja texto responde pedindo texto.
     if (msg.type !== "text") {
       const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou diz ‘quero calcular’ pra usar a calculadora).";
       await sleep(humanDelayMs(quick));
@@ -582,7 +603,7 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // manter #calc pra debug/teste, mas não precisa mais
+    // manter #calc pra debug/teste
     if (userText.toLowerCase() === "#calc") {
       sess.state.mode = "calc";
       sess.state.calc = { shape: null, kit: null, inlineTried: false };
@@ -612,7 +633,6 @@ export default async function handler(req, res) {
     }
 
     // Se o usuário mencionou cálculo e NÃO está no modo calc, oferecer a calculadora
-    // (inclui caso ele mande "30x10x0,5cm" solto)
     if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
       sess.state.pendingCalcConfirm = true;
 
@@ -644,7 +664,6 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         sess.state.pendingCalcConfirm = false;
         // segue modo mentor normal
       } else {
-        // se a pessoa mandar qualquer coisa diferente, repete pergunta simples
         const again = "Só pra eu entender: quer usar a calculadora? Responde 1 (sim) ou 2 (não).";
         await sleep(humanDelayMs(again));
         await sendWhatsAppText({ to: from, bodyText: again, trace });
@@ -667,6 +686,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         else if (n === "4") calc.shape = "camada";
         else {
           const again = buildCalcMenu();
+          await sleep(humanDelayMs(again));
           await sendWhatsAppText({ to: from, bodyText: again, trace });
           return res.status(200).json({ ok: true });
         }
@@ -677,6 +697,17 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         return res.status(200).json({ ok: true });
       }
 
+      // helper: seta medida com parser e avisa se inválido
+      const setLenOrWarn = async (key, parserFn, msg, prompt) => {
+        const v = parserFn(userText);
+        if (v == null || v <= 0) {
+          await sendCalcInvalid({ to: from, trace, msg, prompt });
+          return false;
+        }
+        calc[key] = v;
+        return true;
+      };
+
       // Retângulo: tentar inline 30x10x0,5cm antes das perguntas separadas
       if (calc.shape === "retangulo" && !calc.inlineTried) {
         calc.inlineTried = true;
@@ -686,53 +717,71 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
           calc.c_cm = inline.c_cm;
           calc.l_cm = inline.l_cm;
           calc.a_cm = inline.a_cm;
+
+          // ✅ NOVO: se mandar o kit junto no mesmo texto, captura também
+          const kitInline = parseKitWeights(userText);
+          if (kitInline) calc.kit = kitInline;
         } else {
+          // se não veio "CxLxA", tenta pegar pelo menos o comprimento
           const c = parseLengthToCm(userText);
           if (c) calc.c_cm = c;
+          else {
+            await sendCalcInvalid({
+              to: from,
+              trace,
+              msg: "Não consegui entender essas medidas 😅",
+              prompt: "Me manda assim: 30x10x0,5cm (ou me diz o comprimento, ex: 30cm):",
+            });
+            return res.status(200).json({ ok: true });
+          }
         }
       } else {
-        const setLen = (key, parserFn) => {
-          const v = parserFn(userText);
-          if (v == null || v <= 0) return false;
-          calc[key] = v;
-          return true;
-        };
-
         if (calc.shape === "retangulo") {
           if (calc.c_cm == null) {
-            if (!setLen("c_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento? (ex: 30cm ou 3m)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.l_cm == null) {
-            if (!setLen("l_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", "Largura? (ex: 10cm ou 0,8m)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.a_cm == null) {
-            if (!setLen("a_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura/espessura 😅", "Altura/espessura? (ex: 0,5cm ou 5mm)");
+            if (!ok) return res.status(200).json({ ok: true });
           }
         }
 
         if (calc.shape === "cilindro") {
           if (calc.diam_cm == null) {
-            if (!setLen("diam_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("diam_cm", parseLengthToCm, "Não consegui entender o diâmetro 😅", "Diâmetro? (ex: 10cm ou 0,3m)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.a_cm == null) {
-            if (!setLen("a_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura 😅", "Altura/profundidade? (ex: 3cm ou 30mm)");
+            if (!ok) return res.status(200).json({ ok: true });
           }
         }
 
         if (calc.shape === "triangular") {
           if (calc.base_cm == null) {
-            if (!setLen("base_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("base_cm", parseLengthToCm, "Não consegui entender a base do triângulo 😅", "Base do triângulo? (ex: 12cm)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.alttri_cm == null) {
-            if (!setLen("alttri_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("alttri_cm", parseLengthToCm, "Não consegui entender a altura do triângulo 😅", "Altura do triângulo? (ex: 8cm)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.comp_cm == null) {
-            if (!setLen("comp_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("comp_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento do prisma? (ex: 40cm ou 1,2m)");
+            if (!ok) return res.status(200).json({ ok: true });
           }
         }
 
         if (calc.shape === "camada") {
           if (calc.c_cm == null) {
-            if (!setLen("c_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento da área? (ex: 1m ou 30cm)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.l_cm == null) {
-            if (!setLen("l_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", "Largura da área? (ex: 0,5m ou 20cm)");
+            if (!ok) return res.status(200).json({ ok: true });
           } else if (calc.esp_cm == null) {
-            if (!setLen("esp_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+            const ok = await setLenOrWarn("esp_cm", parseLengthToCm, "Não consegui entender a espessura 😅", "Espessura? (ex: 1mm, 2mm ou 0,2cm)");
+            if (!ok) return res.status(200).json({ ok: true });
           }
         }
       }
@@ -743,6 +792,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         (calc.shape === "triangular" && calc.base_cm != null && calc.alttri_cm != null && calc.comp_cm != null) ||
         (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
+      // Se medidas completas mas kit ainda não veio, pede kit.
       if (measuresComplete && !calc.kit) {
         const kit = parseKitWeights(userText);
         if (kit) {
@@ -786,8 +836,12 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
 
     const parts = splitMessageSmart(replyText, 6);
 
-    // se foi pedido de plano e veio grande, manda 2 partes e deixa resto pendente
-    if (looksLikePlanRequest(userText) && parts.length > 2) {
+    // ✅ NOVO: se for muito grande, também ativa “modo partes” mesmo sem palavra “plano”
+    const shouldChunkLong =
+      looksLikePlanRequest(userText) ||
+      (replyText && replyText.length > 1600);
+
+    if (shouldChunkLong && parts.length > 2) {
       const first = parts.slice(0, 2);
       const rest = parts.slice(2);
 
@@ -798,7 +852,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
 
       sess.state.pendingLong = { fullText: replyText, parts: rest };
 
-      const ask = "Quer que eu detalhe em partes? (sim/continuar)";
+      const ask = "Quer que eu continue em partes? (sim/continuar)";
       await sleep(humanDelayMs(ask));
       await sendWhatsAppText({ to: from, bodyText: ask, trace });
 
