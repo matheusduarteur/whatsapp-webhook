@@ -41,11 +41,11 @@ function sleep(ms) {
 
 function humanDelayMs(text) {
   const len = (text || "").length;
-  const base = 900;
-  const perChar = 14;
-  const jitter = Math.floor(Math.random() * 700);
+  const base = 800;
+  const perChar = 10;
+  const jitter = Math.floor(Math.random() * 600);
   const ms = base + len * perChar + jitter;
-  return Math.min(5000, Math.max(700, ms)); // reduz mínimo pra ficar responsivo
+  return Math.min(4500, Math.max(650, ms));
 }
 
 function splitMessage(text) {
@@ -118,17 +118,86 @@ async function sendWhatsAppText({ to, bodyText, trace }) {
 const DENSITY_KG_PER_L = 1.10;
 const PI = Math.PI;
 
-function parseNumberBR(s) {
-  // aceita "12,5" ou "12.5" e remove espaços
-  const t = (s || "").toString().trim().replace(/\s+/g, "");
-  const norm = t.replace(",", ".");
-  const n = Number(norm);
+// ---- Parsers de unidade (m/cm/mm, kg/g) ----
+
+function normText(s) {
+  return (s || "")
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(",", ".");
+}
+
+function parseNumberOnly(s) {
+  const t = normText(s).replace(/[^0-9.\-]/g, "");
+  const n = Number(t);
   return Number.isFinite(n) ? n : null;
 }
 
+// Converte comprimento para cm
+function parseLengthToCm(input) {
+  // aceita: "3m", "2.5 m", "30cm", "120", "45 mm"
+  const t = normText(input);
+
+  // pega número + unidade opcional
+  const m = t.match(/(-?\d+(\.\d+)?)(\s*)(mm|cm|m)?/);
+  if (!m) return null;
+
+  const val = Number(m[1]);
+  if (!Number.isFinite(val) || val <= 0) return null;
+
+  const unit = (m[4] || "").toLowerCase();
+
+  if (unit === "m") return val * 100;
+  if (unit === "mm") return val / 10;
+  // default = cm
+  return val;
+}
+
+// Converte espessura para cm (aceita mm/cm/m)
+function parseThicknessToCm(input) {
+  return parseLengthToCm(input); // mesma lógica serve
+}
+
+// Converte peso para gramas
+function parseWeightToG(input) {
+  // aceita: "1kg", "0.5 kg", "500g", "120 g", "1000"
+  const t = normText(input);
+
+  // captura número + unidade (kg/g) opcional
+  const m = t.match(/(-?\d+(\.\d+)?)(\s*)(kg|g)?/);
+  if (!m) return null;
+
+  const val = Number(m[1]);
+  if (!Number.isFinite(val) || val <= 0) return null;
+
+  const unit = (m[4] || "").toLowerCase();
+  if (unit === "kg") return val * 1000;
+  // default = g
+  return val;
+}
+
+// tenta ler 2 pesos na mesma mensagem (kit)
+function parseKitWeights(text) {
+  // Ex: "1kg e 500g", "1000g 120g", "1.2kg / 300g"
+  const t = normText(text);
+
+  // pega todos os "n + unidade"
+  const matches = [...t.matchAll(/(\d+(\.\d+)?)(\s*)(kg|g)\b/g)];
+  if (matches.length >= 2) {
+    const resinG = parseWeightToG(matches[0][0]);
+    const hardG = parseWeightToG(matches[1][0]);
+    if (resinG && hardG) return { resinG, hardG };
+  }
+
+  // fallback: se vier "1000 120" sem unidade, não arrisca
+  return null;
+}
+
+// ratio direto (fallback)
 function parseRatio(text) {
-  // aceita "2:1" "2/1" "2x1"
-  const t = (text || "").toLowerCase().replace(/\s+/g, "");
+  const t = normText(text).replace(/\s+/g, "");
   const m = t.match(/^(\d+(\.\d+)?)[\:\/x](\d+(\.\d+)?)$/);
   if (!m) return null;
   const a = Number(m[1]);
@@ -137,32 +206,25 @@ function parseRatio(text) {
   return { resinParts: a, hardenerParts: b }; // RESINA : ENDURECEDOR
 }
 
+// ---- Cálculos ----
+
 function litersFromCm3(cm3) {
-  return cm3 / 1000; // 1000 cm³ = 1 L
+  return cm3 / 1000;
 }
 
 function kgFromLiters(liters) {
   return liters * DENSITY_KG_PER_L;
 }
 
-function gramsFromKg(kg) {
-  return kg * 1000;
-}
-
 function formatKg(kg) {
-  // 0.123 -> "0,12 kg"
   return `${kg.toFixed(2).replace(".", ",")} kg`;
 }
-function formatL(l) {
-  return `${l.toFixed(3).replace(".", ",")} L`;
-}
+
 function formatG(g) {
-  const rounded = Math.round(g);
-  return `${rounded} g`;
+  return `${Math.round(g)} g`;
 }
 
 function computeVolumeLiters(calc) {
-  // calc = { shape, dims }
   const shape = calc.shape;
 
   if (shape === "retangulo") {
@@ -179,20 +241,17 @@ function computeVolumeLiters(calc) {
   }
 
   if (shape === "triangular") {
-    // prisma triangular: (base * alturaTri / 2) * comprimento
     const { base_cm, alttri_cm, comp_cm } = calc;
     const cm3 = (base_cm * alttri_cm / 2) * comp_cm;
     return litersFromCm3(cm3);
   }
 
   if (shape === "camada") {
-    // camada superficial: área (cm²) * espessura (mm)
-    // cm² * mm -> converter para cm³:
-    // 1 mm = 0,1 cm => volume_cm3 = area_cm2 * (esp_mm * 0,1)
-    const { c_cm, l_cm, esp_mm } = calc;
+    // área (cm²) * espessura (cm) => cm³
+    const { c_cm, l_cm, esp_cm } = calc;
     const area_cm2 = c_cm * l_cm;
-    const volume_cm3 = area_cm2 * (esp_mm * 0.1);
-    return litersFromCm3(volume_cm3);
+    const cm3 = area_cm2 * esp_cm;
+    return litersFromCm3(cm3);
   }
 
   return null;
@@ -200,15 +259,16 @@ function computeVolumeLiters(calc) {
 
 function buildCalcMenu() {
   return (
-`🧮 Calculadora de resina (Universidade da Resina)
+`🧮 Calculadora de resina
 
 Escolhe o formato:
-1) Retângulo (C x L x A) — peça “quadrada/retangular”
+1) Retângulo (C x L x A)
 2) Cilindro (diâmetro x altura)
 3) Prisma triangular (base x altura do triângulo x comprimento)
-4) Camada superficial (C x L x espessura em mm)
+4) Camada superficial (C x L x espessura)
 
-Responde só com o número (1 a 4), meu amigo/minha amiga 🙂`
+📌 Pode mandar medidas em cm OU m (ex: 3m). Espessura pode ser mm (ex: 2mm).
+Responde só com o número (1 a 4) 🙂`
   );
 }
 
@@ -216,31 +276,39 @@ function calcNextPrompt(calc) {
   if (!calc.shape) return buildCalcMenu();
 
   if (calc.shape === "retangulo") {
-    if (calc.c_cm == null) return "Me diga o COMPRIMENTO em cm (ex: 30).";
-    if (calc.l_cm == null) return "Agora a LARGURA em cm (ex: 20).";
-    if (calc.a_cm == null) return "Agora a ALTURA/ESPESSURA do vazamento em cm (ex: 2).";
+    if (calc.c_cm == null) return "Me diga o COMPRIMENTO (ex: 30cm ou 3m).";
+    if (calc.l_cm == null) return "Agora a LARGURA (ex: 20cm ou 0,8m).";
+    if (calc.a_cm == null) return "Agora a ALTURA/ESPESSURA do vazamento (ex: 2cm ou 20mm).";
   }
 
   if (calc.shape === "cilindro") {
-    if (calc.diam_cm == null) return "Qual o DIÂMETRO em cm? (ex: 10)";
-    if (calc.a_cm == null) return "Qual a ALTURA/PROFUNDIDADE em cm? (ex: 3)";
+    if (calc.diam_cm == null) return "Qual o DIÂMETRO? (ex: 10cm ou 0,3m)";
+    if (calc.a_cm == null) return "Qual a ALTURA/PROFUNDIDADE? (ex: 3cm ou 30mm)";
   }
 
   if (calc.shape === "triangular") {
-    if (calc.base_cm == null) return "Qual a BASE do triângulo em cm? (ex: 12)";
-    if (calc.alttri_cm == null) return "Qual a ALTURA do triângulo em cm? (ex: 8)";
-    if (calc.comp_cm == null) return "Qual o COMPRIMENTO do prisma em cm? (ex: 40)";
+    if (calc.base_cm == null) return "Qual a BASE do triângulo? (ex: 12cm)";
+    if (calc.alttri_cm == null) return "Qual a ALTURA do triângulo? (ex: 8cm)";
+    if (calc.comp_cm == null) return "Qual o COMPRIMENTO do prisma? (ex: 40cm ou 1,2m)";
   }
 
   if (calc.shape === "camada") {
-    if (calc.c_cm == null) return "Me diga o COMPRIMENTO da área em cm (ex: 30).";
-    if (calc.l_cm == null) return "Agora a LARGURA da área em cm (ex: 20).";
-    if (calc.esp_mm == null) return "Qual a ESPESSURA da camada em mm? (ex: 1 ou 2)";
+    if (calc.c_cm == null) return "Me diga o COMPRIMENTO da área (ex: 30cm ou 1m).";
+    if (calc.l_cm == null) return "Agora a LARGURA da área (ex: 20cm ou 0,5m).";
+    if (calc.esp_cm == null) return "Qual a ESPESSURA da camada? (ex: 1mm, 2mm ou 0,2cm)";
   }
 
-  // Depois do volume, pedir proporção
-  if (!calc.ratio) {
-    return "Qual a proporção da sua resina? (RESINA:ENDURECEDOR) Ex: 1:1 ou 2:1";
+  // Kit para descobrir proporção (universal)
+  if (!calc.kit) {
+    return (
+`Agora me diga o KIT que você comprou (pra eu achar a proporção certinha):
+
+➡️ Quanto veio de RESINA e quanto veio de ENDURECEDOR?
+Exemplos:
+- "1kg e 500g"
+- "1000g e 120g"
+- "1,2kg e 300g"`
+    );
   }
 
   return null;
@@ -248,26 +316,31 @@ function calcNextPrompt(calc) {
 
 function finishCalcMessage(calc) {
   const liters = computeVolumeLiters(calc);
-  const kg = kgFromLiters(liters);
-  const g = gramsFromKg(kg);
+  const kgTotal = kgFromLiters(liters);
+  const gTotal = kgTotal * 1000;
 
-  const { resinParts, hardenerParts } = calc.ratio;
-  const totalParts = resinParts + hardenerParts;
+  // Proporção pelo kit
+  const resinParts = calc.kit.resinG;
+  const hardParts = calc.kit.hardG;
+  const totalParts = resinParts + hardParts;
 
-  const resin_g = (g * (resinParts / totalParts));
-  const hard_g = (g * (hardenerParts / totalParts));
+  const resin_g = gTotal * (resinParts / totalParts);
+  const hard_g = gTotal * (hardParts / totalParts);
+
+  const ratioApprox = (resinParts / hardParts);
+  const ratioText = ratioApprox > 0 ? `≈ ${ratioApprox.toFixed(2).replace(".", ",")}:1` : "—";
 
   const msg =
 `✅ Cálculo pronto
 
-📦 Volume: ${formatL(liters)}
-⚖️ Peso aproximado (densidade 1,10 kg/L): ${formatKg(kg)} (${formatG(g)})
+⚖️ Total aproximado: ${formatKg(kgTotal)} (${formatG(gTotal)})
 
-🧪 Proporção (RESINA:ENDURECEDOR) = ${resinParts}:${hardenerParts}
-➡️ Resina: ${formatG(resin_g)}
-➡️ Endurecedor: ${formatG(hard_g)}
+🧪 Mistura (com base no seu KIT):
+- Resina: ${formatG(resin_g)}
+- Endurecedor: ${formatG(hard_g)}
+(razão RESINA:ENDURECEDOR ${ratioText})
 
-💡 Dica: na prática pode variar. Se for madeira (ou tiver perda no copo/selagem), considera fazer ~10% a mais pra garantir.
+💡 Dica rápida: se for madeira (selagem fraca, frestas, perda no copo), faz ~10% a mais pra garantir. Se for molde silicone bem fechado, dá pra seguir mais “no alvo”.
 
 Quer calcular outra peça? Digita #calc 🙂`;
 
@@ -316,7 +389,7 @@ BASE TÉCNICA (resumo)
 - Resina baixa: selagem/camadas finas; não usar em grandes volumes.
 - Média: versátil (tábuas/bandejas/peças médias).
 - Alta: vazamentos altos (mesas); respeitar altura máxima por camada e tempo entre camadas.
-- Madeira ideal 8–12% de umidade; madeira úmida causa bolhas/trincas/descolamento.
+- Madeira ideal 8–12% umidade; madeira úmida causa bolhas/trincas/descolamento.
 - Selagem reduz bolhas e economiza resina.
 - Ambiente ideal 20–25°C; evitar vento/poeira/sol direto; base nivelada.
 - Mistura em peso, devagar 3–5min raspando laterais/fundo; trocar de recipiente ajuda.
@@ -329,6 +402,7 @@ REGRAS
 - Não invente dados específicos de marca/linha. Se precisar, peça rótulo/ficha técnica.
 - Quando for recomendação geral, deixe claro ("como regra geral...").
 - Termine com UMA pergunta prática que avance o caso.
+- Se o aluno quiser calcular resina, oriente: "digita #calc".
 
 Horário (SP): ${spTime}
 `.trim();
@@ -387,7 +461,6 @@ export default async function handler(req, res) {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const value = body?.entry?.[0]?.changes?.[0]?.value;
 
-    // ignora status
     if (value?.statuses?.length) return res.status(200).json({ ok: true });
 
     const msg = value?.messages?.[0];
@@ -400,15 +473,10 @@ export default async function handler(req, res) {
     cleanupMap(processed, 10 * 60 * 1000);
     cleanupSessions();
 
-    if (seenRecently(msgId)) {
-      console.log("🔁 Duplicate ignored:", { trace });
-      return res.status(200).json({ ok: true });
-    }
+    if (seenRecently(msgId)) return res.status(200).json({ ok: true });
 
-    // ignora figurinha
     if (msg.type === "sticker") return res.status(200).json({ ok: true });
 
-    // Outros tipos: pede texto
     if (msg.type !== "text") {
       const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida ou digita #calc pra calcular resina.";
       await sleep(humanDelayMs(quick));
@@ -421,7 +489,6 @@ export default async function handler(req, res) {
 
     const sess = ensureSession(from);
 
-    // comandos
     if (userText.toLowerCase() === "#reset") {
       sessions.delete(from);
       const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
@@ -430,17 +497,16 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // entra no modo calc
     if (userText.toLowerCase() === "#calc") {
       sess.state.mode = "calc";
-      sess.state.calc = { shape: null, ratio: null };
+      sess.state.calc = { shape: null, kit: null };
       const prompt = calcNextPrompt(sess.state.calc);
       await sleep(humanDelayMs(prompt));
       await sendWhatsAppText({ to: from, bodyText: prompt, trace });
       return res.status(200).json({ ok: true });
     }
 
-    // se estiver em modo calc, processa o passo
+    // MODO CALC
     if (sess.state.mode === "calc" && sess.state.calc) {
       const calc = sess.state.calc;
 
@@ -463,9 +529,9 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // coleta medidas conforme shape
-      const setNextNumber = (key) => {
-        const v = parseNumberBR(userText);
+      // coleta medidas
+      const setLen = (key, parserFn) => {
+        const v = parserFn(userText);
         if (v == null || v <= 0) return false;
         calc[key] = v;
         return true;
@@ -473,97 +539,87 @@ export default async function handler(req, res) {
 
       if (calc.shape === "retangulo") {
         if (calc.c_cm == null) {
-          if (!setNextNumber("c_cm")) {
-            return res.status(200).json({ ok: true });
-          }
+          if (!setLen("c_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         } else if (calc.l_cm == null) {
-          if (!setNextNumber("l_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("l_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         } else if (calc.a_cm == null) {
-          if (!setNextNumber("a_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("a_cm", parseThicknessToCm)) return res.status(200).json({ ok: true });
         }
       }
 
       if (calc.shape === "cilindro") {
         if (calc.diam_cm == null) {
-          if (!setNextNumber("diam_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("diam_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         } else if (calc.a_cm == null) {
-          if (!setNextNumber("a_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("a_cm", parseThicknessToCm)) return res.status(200).json({ ok: true });
         }
       }
 
       if (calc.shape === "triangular") {
         if (calc.base_cm == null) {
-          if (!setNextNumber("base_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("base_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         } else if (calc.alttri_cm == null) {
-          if (!setNextNumber("alttri_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("alttri_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         } else if (calc.comp_cm == null) {
-          if (!setNextNumber("comp_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("comp_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         }
       }
 
       if (calc.shape === "camada") {
         if (calc.c_cm == null) {
-          if (!setNextNumber("c_cm")) return res.status(200).json({ ok: true });
+          if (!setLen("c_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
         } else if (calc.l_cm == null) {
-          if (!setNextNumber("l_cm")) return res.status(200).json({ ok: true });
-        } else if (calc.esp_mm == null) {
-          const v = parseNumberBR(userText);
-          if (v == null || v <= 0) return res.status(200).json({ ok: true });
-          calc.esp_mm = v;
+          if (!setLen("l_cm", parseLengthToCm)) return res.status(200).json({ ok: true });
+        } else if (calc.esp_cm == null) {
+          // aqui a pessoa pode mandar mm/cm/m, tudo vira cm
+          if (!setLen("esp_cm", parseThicknessToCm)) return res.status(200).json({ ok: true });
         }
       }
 
-      // se já tem medidas, pedir proporção
-      const prompt = calcNextPrompt(calc);
-      if (prompt) {
-        // ainda falta algo
-        if (!calc.ratio && (calc.c_cm != null || calc.diam_cm != null || calc.base_cm != null)) {
-          // se estamos na etapa da proporção, parseia
-          if (
-            (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
-            (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
-            (calc.shape === "triangular" && calc.base_cm != null && calc.alttri_cm != null && calc.comp_cm != null) ||
-            (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_mm != null)
-          ) {
-            // se a próxima pergunta for proporção, tenta parsear se o usuário já mandou ratio
-            if (prompt.toLowerCase().includes("proporção")) {
-              const ratio = parseRatio(userText);
-              if (ratio) {
-                calc.ratio = ratio;
-              } else {
-                // se ainda não tem ratio, manda pergunta de ratio
-                await sleep(humanDelayMs(prompt));
-                await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-                return res.status(200).json({ ok: true });
-              }
-            }
-          }
-        }
+      // Se medidas completas e ainda não tem kit, pedir kit e tentar parsear
+      const measuresComplete =
+        (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
+        (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
+        (calc.shape === "triangular" && calc.base_cm != null && calc.alttri_cm != null && calc.comp_cm != null) ||
+        (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
-        // se ratio já veio agora, finaliza
-        if (calc.ratio) {
-          const done = finishCalcMessage(calc);
-          sess.state.mode = "mentor";
-          sess.state.calc = null;
-          await sleep(humanDelayMs(done));
-          await sendWhatsAppText({ to: from, bodyText: done, trace });
+      if (measuresComplete && !calc.kit) {
+        // tenta interpretar a mensagem atual como kit (se o usuário já mandou)
+        const kit = parseKitWeights(userText);
+        if (kit) {
+          calc.kit = kit;
+        } else {
+          const prompt = calcNextPrompt(calc);
+          await sleep(humanDelayMs(prompt));
+          await sendWhatsAppText({ to: from, bodyText: prompt, trace });
           return res.status(200).json({ ok: true });
         }
+      }
 
-        // caso geral: manda o próximo prompt
-        await sleep(humanDelayMs(prompt));
-        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+      // Se ainda não tem kit, mas já estamos na etapa dele, parseia
+      if (measuresComplete && !calc.kit) {
+        const kit = parseKitWeights(userText);
+        if (kit) calc.kit = kit;
+      }
+
+      // finaliza se tem kit
+      if (measuresComplete && calc.kit) {
+        const done = finishCalcMessage(calc);
+        sess.state.mode = "mentor";
+        sess.state.calc = null;
+        await sleep(humanDelayMs(done));
+        await sendWhatsAppText({ to: from, bodyText: done, trace });
         return res.status(200).json({ ok: true });
       }
 
-      // fallback (não deveria chegar aqui)
-      sess.state.mode = "mentor";
-      sess.state.calc = null;
-      await sendWhatsAppText({ to: from, bodyText: "Beleza! Se quiser calcular outra peça, digita #calc 🙂", trace });
+      // ainda falta algo -> pergunta próxima etapa
+      const prompt = calcNextPrompt(calc);
+      await sleep(humanDelayMs(prompt));
+      await sendWhatsAppText({ to: from, bodyText: prompt, trace });
       return res.status(200).json({ ok: true });
     }
 
-    // modo mentor (normal)
+    // MODO MENTOR
     const replyText = await getAIReply({ history: sess.history, userText, trace });
 
     sess.history.push({ role: "user", content: userText });
