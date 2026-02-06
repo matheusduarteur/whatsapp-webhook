@@ -192,8 +192,6 @@ async function ensureSession(from) {
         calc: null,
         pendingLong: null,
         pendingCalcConfirm: false,
-
-        // imagem (opção 2): guarda a mídia até o aluno dizer o que quer analisar
         pendingImage: null, // { mediaId, caption, ts }
       },
       _lastTs: Date.now(),
@@ -226,7 +224,7 @@ ${prompt}`;
 }
 
 /* =========================
-   Detector de intenção da calculadora / respostas
+   Detector de intenção / normalização
    ========================= */
 function normalizeLoose(s) {
   return (s || "")
@@ -281,6 +279,11 @@ function isNo(text) {
 function isCancel(text) {
   const s = normalizeLoose(text);
   return ["cancelar", "cancela", "deixa", "deixa pra la", "deixa pra lá", "nao", "não", "para", "pare"].includes(s);
+}
+
+function isEscapeCalc(text) {
+  const s = normalizeLoose(text);
+  return ["sair", "cancelar", "cancela", "parar", "para", "voltar", "menu", "#mentor", "mentor"].includes(s);
 }
 
 /* =========================
@@ -411,39 +414,43 @@ function calcNextPrompt(calc) {
       return `Me manda as medidas. Pode ser assim:
 - Tudo junto: 30x10x0,5cm
 ou
-- Separado: comprimento (ex: 30cm ou 3m)`;
+- Separado: comprimento (ex: 30cm ou 3m)
+
+(Se quiser sair da calculadora: manda "sair")`;
     }
-    if (calc.c_cm == null) return "Comprimento? (ex: 30cm ou 3m)";
-    if (calc.l_cm == null) return "Largura? (ex: 10cm ou 0,8m)";
-    if (calc.a_cm == null) return "Altura/espessura do vazamento? (ex: 0,5cm ou 5mm)";
+    if (calc.c_cm == null) return 'Comprimento? (ex: 30cm ou 3m) — ou manda "sair"';
+    if (calc.l_cm == null) return 'Largura? (ex: 10cm ou 0,8m) — ou manda "sair"';
+    if (calc.a_cm == null) return 'Altura/espessura? (ex: 0,5cm ou 5mm) — ou manda "sair"';
   }
 
   if (calc.shape === "cilindro") {
-    if (calc.diam_cm == null) return "Diâmetro? (ex: 10cm ou 0,3m)";
-    if (calc.a_cm == null) return "Altura/profundidade? (ex: 3cm ou 30mm)";
+    if (calc.diam_cm == null) return 'Diâmetro? (ex: 10cm ou 0,3m) — ou manda "sair"';
+    if (calc.a_cm == null) return 'Altura/profundidade? (ex: 3cm ou 30mm) — ou manda "sair"';
   }
 
   if (calc.shape === "triangular") {
-    if (calc.base_cm == null) return "Base do triângulo? (ex: 12cm)";
-    if (calc.alttri_cm == null) return "Altura do triângulo? (ex: 8cm)";
-    if (calc.comp_cm == null) return "Comprimento do prisma? (ex: 40cm ou 1,2m)";
+    if (calc.base_cm == null) return 'Base do triângulo? (ex: 12cm) — ou manda "sair"';
+    if (calc.alttri_cm == null) return 'Altura do triângulo? (ex: 8cm) — ou manda "sair"';
+    if (calc.comp_cm == null) return 'Comprimento do prisma? (ex: 40cm ou 1,2m) — ou manda "sair"';
   }
 
   if (calc.shape === "camada") {
-    if (calc.c_cm == null) return "Comprimento da área? (ex: 1m ou 30cm)";
-    if (calc.l_cm == null) return "Largura da área? (ex: 0,5m ou 20cm)";
-    if (calc.esp_cm == null) return "Espessura da camada? (ex: 1mm, 2mm ou 0,2cm)";
+    if (calc.c_cm == null) return 'Comprimento da área? (ex: 1m ou 30cm) — ou manda "sair"';
+    if (calc.l_cm == null) return 'Largura da área? (ex: 0,5m ou 20cm) — ou manda "sair"';
+    if (calc.esp_cm == null) return 'Espessura? (ex: 1mm, 2mm ou 0,2cm) — ou manda "sair"';
   }
 
   if (!calc.kit) {
     return (
-`Agora me diz o KIT que você comprou (pra eu achar a proporção certinha):
+`Agora me diz o KIT pra eu achar a proporção certinha:
 
 ➡️ Quanto veio de RESINA e quanto veio de ENDURECEDOR?
 Exemplos:
 - "1kg e 500g"
 - "1000g e 120g"
-- "1,2kg e 300g"`
+- "1,2kg e 300g"
+
+(Se quiser sair da calculadora: manda "sair")`
     );
   }
 
@@ -605,9 +612,7 @@ function arrayBufferToBase64(ab) {
 }
 
 async function analyzeImageWithOpenAI({ imageArrayBuffer, mimeType, userRequest, caption, history, trace }) {
-  // model que suporta visão
   const model = process.env.OPENAI_VISION_MODEL || process.env.OPENAI_MODEL || "gpt-4o-mini";
-
   const spTime = nowInSaoPaulo();
 
   const system = `
@@ -617,10 +622,10 @@ Você é mentor técnico + amigo no WhatsApp: direto, prático, sem enrolar (0�
 VOCÊ VAI ANALISAR UMA IMAGEM enviada por um aluno (peça com resina/ madeira / molde / acabamento).
 Regras:
 - NÃO invente detalhes que não dá pra ver.
-- Se algo estiver incerto pela imagem, diga o que você precisa que o aluno confirme.
+- Se algo estiver incerto, diga o que você precisa confirmar.
 - Foque em: bolhas, cura/pegajosidade, marcas de lixamento, contaminação/poeira, selagem, nivelamento, vazamento/moldes.
-- Entregue: (1) diagnóstico provável, (2) causa mais provável, (3) passo a passo do que fazer agora, (4) prevenção no próximo projeto.
-- Termine com 1 pergunta objetiva (ex: “Qual resina você usou: baixa/média/alta? e qual espessura?”)
+- Entregue: (1) diagnóstico provável, (2) causa provável, (3) o que fazer agora, (4) prevenção no próximo projeto.
+- Termine com 1 pergunta objetiva.
 
 Horário (SP): ${spTime}
 `.trim();
@@ -708,17 +713,17 @@ BASE TÉCNICA (resumo)
 - Segurança: luvas, máscara, óculos, ventilação, longe de alimentos/crianças.
 
 REGRA IMPORTANTE SOBRE CÁLCULOS
-- Se o usuário pedir cálculo de volume/quantidade de resina/quanto vai de resina/endurecedor, NÃO faça conta manual no texto.
-- Em vez disso, ofereça a "Calculadora exclusiva da Universidade da Resina" e peça confirmação (sim/não).
+- Se o usuário pedir cálculo, NÃO faça conta manual no texto.
+- Ofereça a calculadora e peça confirmação (1 sim / 2 não).
 
 PLANOS LONGOS
-Quando o usuário pedir um PLANO/GUIA/CHECKLIST longo:
-1) responda primeiro com um RESUMO curto (7–10 linhas)
-2) finalize com: "Quer que eu detalhe em partes? (sim/continuar)"
+Quando pedir plano/guia/checklist:
+1) resumo curto (7–10 linhas)
+2) "Quer que eu detalhe em partes? (sim/continuar)"
 
 REGRAS
-- Não invente dados específicos de marca/linha. Se precisar, peça rótulo/ficha técnica.
-- Termine com UMA pergunta prática que avance o caso.
+- Não invente marca/linha.
+- Termine com UMA pergunta prática.
 
 Horário (SP): ${spTime}
 `.trim();
@@ -804,7 +809,6 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // guarda pra próxima mensagem do aluno
       sess.state.pendingImage = { mediaId, caption: caption || "", ts: Date.now() };
       await kvSetSession(from, sess);
 
@@ -855,8 +859,6 @@ Exemplos:
       }
 
       userText = transcript.trim();
-
-      // evita inflar histórico
       sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText.slice(0, 900)}` });
       if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
     } else {
@@ -864,6 +866,38 @@ Exemplos:
       await sleep(humanDelayMs(quick));
       await sendWhatsAppText({ to: from, bodyText: quick, trace });
       return res.status(200).json({ ok: true });
+    }
+
+    /* =========================
+       Escape UNIVERSAL: #reset (zera tudo)
+       ========================= */
+    if (normalizeLoose(userText) === "#reset") {
+      await kvDelSession(from);
+      const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
+      await sleep(humanDelayMs(ok));
+      await sendWhatsAppText({ to: from, bodyText: ok, trace });
+      return res.status(200).json({ ok: true });
+    }
+
+    /* =========================
+       Escape da CALCULADORA (sem resetar sessão)
+       - funciona mesmo se estiver preso pedindo kit
+       - funciona mesmo se estiver na confirmação 1/2
+       ========================= */
+    if (sess.state.mode === "calc" || sess.state.pendingCalcConfirm) {
+      if (isEscapeCalc(userText)) {
+        sess.state.mode = "mentor";
+        sess.state.calc = null;
+        sess.state.pendingCalcConfirm = false;
+
+        const ok =
+          "Fechado 🙂 Saímos da calculadora e voltamos pro mentor. Me diz qual é a tua dúvida agora (ou, se quiser calcular depois, é só mandar “quero calcular”).";
+        await sleep(humanDelayMs(ok));
+        await sendWhatsAppText({ to: from, bodyText: ok, trace });
+
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
+      }
     }
 
     /* =========================
@@ -891,19 +925,18 @@ Exemplos:
         sess.state.pendingImage = null;
         await kvSetSession(from, sess);
 
-        const fail = "Não consegui baixar essa foto 😅 Pode reenviar (de preferência com boa luz) e me dizer o que avaliar?";
+        const fail = "Não consegui baixar essa foto 😅 Pode reenviar (boa luz) e me dizer o que avaliar?";
         await sleep(humanDelayMs(fail));
         await sendWhatsAppText({ to: from, bodyText: fail, trace });
         return res.status(200).json({ ok: true });
       }
 
-      // proteção simples contra arquivos gigantes
       if (meta.file_size && Number(meta.file_size) > 6_000_000) {
         sess.state.pendingImage = null;
         await kvSetSession(from, sess);
 
         const big =
-          "Essa foto veio bem pesada 😅 Se puder, manda de novo em resolução menor (ou como ‘foto’ normal, não ‘documento’) que eu analiso certinho.";
+          "Essa foto veio bem pesada 😅 Se puder, manda de novo em resolução menor (como ‘foto’ normal, não ‘documento’) que eu analiso certinho.";
         await sleep(humanDelayMs(big));
         await sendWhatsAppText({ to: from, bodyText: big, trace });
         return res.status(200).json({ ok: true });
@@ -914,7 +947,7 @@ Exemplos:
         sess.state.pendingImage = null;
         await kvSetSession(from, sess);
 
-        const fail = "Não consegui baixar essa foto 😅 Pode reenviar com boa luz e mais perto da peça?";
+        const fail = "Não consegui baixar essa foto 😅 Pode reenviar com mais luz e mais perto da peça?";
         await sleep(humanDelayMs(fail));
         await sendWhatsAppText({ to: from, bodyText: fail, trace });
         return res.status(200).json({ ok: true });
@@ -929,10 +962,8 @@ Exemplos:
         trace,
       });
 
-      // limpa pendência
       sess.state.pendingImage = null;
 
-      // salva histórico curto (pra manter contexto sem explodir Redis)
       sess.history.push({ role: "user", content: `🖼️ (imagem) ${userText.slice(0, 300)}` });
       sess.history.push({ role: "assistant", content: analysis.slice(0, 900) });
       if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
@@ -944,21 +975,12 @@ Exemplos:
         await sleep(humanDelayMs(part));
         await sendWhatsAppText({ to: from, bodyText: part, trace });
       }
-
       return res.status(200).json({ ok: true });
     }
 
     /* =========================
-       comandos
+       debug calc
        ========================= */
-    if (normalizeLoose(userText) === "#reset") {
-      await kvDelSession(from);
-      const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
-      await sleep(humanDelayMs(ok));
-      await sendWhatsAppText({ to: from, bodyText: ok, trace });
-      return res.status(200).json({ ok: true });
-    }
-
     if (normalizeLoose(userText) === "#calc") {
       sess.state.mode = "calc";
       sess.state.calc = { shape: null, kit: null, inlineTried: false };
@@ -1005,7 +1027,9 @@ Exemplos:
 Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina/endurecedor).
 
 1) Sim, quero calcular
-2) Não, só uma orientação`;
+2) Não, só uma orientação
+(Se quiser sair: manda "sair")`;
+
       await sleep(humanDelayMs(offer));
       await sendWhatsAppText({ to: from, bodyText: offer, trace });
 
@@ -1031,7 +1055,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         sess.state.pendingCalcConfirm = false;
         // segue mentor
       } else {
-        const again = "Só pra eu entender: quer usar a calculadora? Responde 1 (sim) ou 2 (não).";
+        const again = 'Só pra eu entender: quer usar a calculadora? Responde 1 (sim) ou 2 (não). (ou manda "sair")';
         await sleep(humanDelayMs(again));
         await sendWhatsAppText({ to: from, bodyText: again, trace });
 
@@ -1045,6 +1069,21 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
        ========================= */
     if (sess.state.mode === "calc" && sess.state.calc) {
       const calc = sess.state.calc;
+
+      // ✅ escape dentro do modo calc (extra segurança)
+      if (isEscapeCalc(userText)) {
+        sess.state.mode = "mentor";
+        sess.state.calc = null;
+        sess.state.pendingCalcConfirm = false;
+
+        const ok =
+          "Fechado 🙂 Saímos da calculadora e voltamos pro mentor. Me diz qual é a tua dúvida agora.";
+        await sleep(humanDelayMs(ok));
+        await sendWhatsAppText({ to: from, bodyText: ok, trace });
+
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
+      }
 
       if (!calc.shape) {
         const n = userText.trim();
@@ -1107,49 +1146,49 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
       } else {
         if (calc.shape === "retangulo") {
           if (calc.c_cm == null) {
-            const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento? (ex: 30cm ou 3m)");
+            const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", 'Comprimento? (ex: 30cm ou 3m) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.l_cm == null) {
-            const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", "Largura? (ex: 10cm ou 0,8m)");
+            const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", 'Largura? (ex: 10cm ou 0,8m) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.a_cm == null) {
-            const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura/espessura 😅", "Altura/espessura? (ex: 0,5cm ou 5mm)");
+            const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura/espessura 😅", 'Altura/espessura? (ex: 0,5cm ou 5mm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
 
         if (calc.shape === "cilindro") {
           if (calc.diam_cm == null) {
-            const ok = await setLenOrWarn("diam_cm", parseLengthToCm, "Não consegui entender o diâmetro 😅", "Diâmetro? (ex: 10cm ou 0,3m)");
+            const ok = await setLenOrWarn("diam_cm", parseLengthToCm, "Não consegui entender o diâmetro 😅", 'Diâmetro? (ex: 10cm ou 0,3m) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.a_cm == null) {
-            const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura 😅", "Altura/profundidade? (ex: 3cm ou 30mm)");
+            const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura 😅", 'Altura/profundidade? (ex: 3cm ou 30mm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
 
         if (calc.shape === "triangular") {
           if (calc.base_cm == null) {
-            const ok = await setLenOrWarn("base_cm", parseLengthToCm, "Não consegui entender a base do triângulo 😅", "Base do triângulo? (ex: 12cm)");
+            const ok = await setLenOrWarn("base_cm", parseLengthToCm, "Não consegui entender a base do triângulo 😅", 'Base do triângulo? (ex: 12cm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.alttri_cm == null) {
-            const ok = await setLenOrWarn("alttri_cm", parseLengthToCm, "Não consegui entender a altura do triângulo 😅", "Altura do triângulo? (ex: 8cm)");
+            const ok = await setLenOrWarn("alttri_cm", parseLengthToCm, "Não consegui entender a altura do triângulo 😅", 'Altura do triângulo? (ex: 8cm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.comp_cm == null) {
-            const ok = await setLenOrWarn("comp_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento do prisma? (ex: 40cm ou 1,2m)");
+            const ok = await setLenOrWarn("comp_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", 'Comprimento do prisma? (ex: 40cm ou 1,2m) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
 
         if (calc.shape === "camada") {
           if (calc.c_cm == null) {
-            const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento da área? (ex: 1m ou 30cm)");
+            const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", 'Comprimento da área? (ex: 1m ou 30cm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.l_cm == null) {
-            const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", "Largura da área? (ex: 0,5m ou 20cm)");
+            const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", 'Largura da área? (ex: 0,5m ou 20cm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.esp_cm == null) {
-            const ok = await setLenOrWarn("esp_cm", parseLengthToCm, "Não consegui entender a espessura 😅", "Espessura? (ex: 1mm, 2mm ou 0,2cm)");
+            const ok = await setLenOrWarn("esp_cm", parseLengthToCm, "Não consegui entender a espessura 😅", 'Espessura? (ex: 1mm, 2mm ou 0,2cm) — ou manda "sair"');
             if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
@@ -1203,7 +1242,6 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
        ========================= */
     const replyText = await getAIReply({ history: sess.history, userText, trace });
 
-    // salva histórico (reduzido pra economizar Redis)
     sess.history.push({ role: "user", content: userText.slice(0, 700) });
     sess.history.push({ role: "assistant", content: replyText.slice(0, 900) });
     if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
