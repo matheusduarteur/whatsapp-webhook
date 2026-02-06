@@ -180,13 +180,13 @@ async function kvDelSession(from) {
 /**
  * Dedup ATÔMICO (perfeito pra serverless):
  * SET key value NX EX ttl
- * Retorna true se já tinha sido visto.
+ * Retorna true se a mensagem é DUPLICADA (já tinha sido vista).
  */
-async function seenRecently(msgId) {
+async function isDuplicateMsg(msgId) {
   if (!msgId) return false;
   const r = await getRedis();
-  const ok = await r.set(keySeen(msgId), "1", { NX: true, EX: DEDUP_TTL_SECONDS });
-  return ok === null;
+  const result = await r.set(keySeen(msgId), "1", { NX: true, EX: DEDUP_TTL_SECONDS });
+  return result === null; // null => já existia => duplicada
 }
 
 async function ensureSession(from) {
@@ -944,7 +944,7 @@ export default async function handler(req, res) {
     const trace = `${from}:${msgId || "noid"}`;
 
     // Dedup global (Redis)
-    if (await seenRecently(msgId)) return res.status(200).json({ ok: true });
+    if (await isDuplicateMsg(msgId)) return res.status(200).json({ ok: true });
 
     if (msg.type === "sticker") return res.status(200).json({ ok: true });
 
@@ -956,20 +956,24 @@ export default async function handler(req, res) {
        ========================= */
     const now = Date.now();
 
-    // se bot tá em handoff e a pessoa manda qualquer coisa: não competir
+    // Se bot tá em handoff e a pessoa manda qualquer coisa: não competir
+    // MAS: deixa passar comandos úteis (#bot, #reset, #calc e intenção de cálculo)
     if (sess.state.humanHandoffUntil && sess.state.humanHandoffUntil > now) {
-      // exceção: se pedir voltar
       if (msg.type === "text") {
         const t = msg.text?.body?.trim() || "";
-        if (wantsBotBack(t)) {
+        const s = normalizeLoose(t);
+        const allow = wantsBotBack(t) || s === "#reset" || s === "#calc" || isCalcIntent(t);
+
+        if (allow) {
           sess.state.humanHandoffUntil = 0;
-          const back = `Fechado 🙂 Aqui é o ${SEVERINO_NAME} de volta. Me diz o que você precisa agora.`;
-          await sleep(humanDelayMs(back));
-          await sendWhatsAppText({ to: from, bodyText: back, trace });
           await kvSetSession(from, sess);
+          // segue o fluxo normal (não dá return)
+        } else {
+          return res.status(200).json({ ok: true });
         }
+      } else {
+        return res.status(200).json({ ok: true });
       }
-      return res.status(200).json({ ok: true });
     }
 
     /* =========================
@@ -1262,6 +1266,21 @@ Como posso te chamar? 🙂`;
        Oferta da calculadora
        ========================= */
     if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
+      // ✅ Se já veio medidas 3D "30x10x0,5cm", entra direto no modo calc (retângulo)
+      const inlineDims = parseDims3Inline(userText);
+      if (inlineDims) {
+        sess.state.mode = "calc";
+        sess.state.calc = { shape: "retangulo", kit: null, inlineTried: true, ...inlineDims };
+        sess.state.pendingCalcConfirm = false;
+
+        const prompt = calcNextPrompt(sess.state.calc);
+        await sleep(humanDelayMs(prompt));
+        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
+      }
+
       sess.state.pendingCalcConfirm = true;
 
       const offer = `🧮 Quer usar a Calculadora exclusiva da Universidade da Resina?
