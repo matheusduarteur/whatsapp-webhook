@@ -1,35 +1,38 @@
 // /api/webhook.js
-// ✅ WhatsApp Cloud API webhook (Vercel) + Mentor (OpenAI) + Calculadora + Áudio (transcrição)
+// WhatsApp Cloud API (Vercel) + Mentor (OpenAI) + Calculadora + Áudio + Redis (REDIS_URL)
 
-const sessions = new Map(); // from -> { history: [], state: {...}, _lastTs }
-const processed = new Map(); // msgId -> timestamp
+import { createClient } from "redis";
 
 /* =========================
-   Utils básicos
+   Redis (global / lazy)
    ========================= */
-function cleanupMap(map, ttlMs) {
-  const now = Date.now();
-  for (const [k, v] of map.entries()) if (now - v > ttlMs) map.delete(k);
+let _redis;
+
+async function getRedis() {
+  if (_redis && _redis.isOpen) return _redis;
+
+  const url = process.env.REDIS_URL;
+  if (!url) throw new Error("Missing env var: REDIS_URL");
+
+  _redis = createClient({ url });
+  _redis.on("error", (err) => console.log("❌ Redis error:", err?.message || err));
+
+  await _redis.connect();
+  return _redis;
 }
 
-function cleanupSessions(ttlMs = 6 * 60 * 60 * 1000) {
-  const now = Date.now();
-  for (const [k, v] of sessions.entries()) {
-    const last = v?._lastTs || 0;
-    if (last && now - last > ttlMs) sessions.delete(k);
-  }
-}
+/* =========================
+   TTLs
+   ========================= */
+const SESSION_TTL_SECONDS = 6 * 60 * 60; // 6h
+const DEDUP_TTL_SECONDS = 10 * 60; // 10min
 
-function seenRecently(msgId, ttlMs = 10 * 60 * 1000) {
-  if (!msgId) return false;
-  cleanupMap(processed, ttlMs);
-  const now = Date.now();
-  const ts = processed.get(msgId);
-  if (ts && now - ts < ttlMs) return true;
-  processed.set(msgId, now);
-  return false;
-}
+const keySess = (from) => `sess:${from}`;
+const keySeen = (msgId) => `seen:${msgId}`;
 
+/* =========================
+   Utils
+   ========================= */
 function nowInSaoPaulo() {
   return new Intl.DateTimeFormat("pt-BR", {
     timeZone: "America/Sao_Paulo",
@@ -51,9 +54,6 @@ function humanDelayMs(text) {
   return Math.min(4500, Math.max(550, ms));
 }
 
-/**
- * Envia respostas longas em várias partes (sem “travamento”).
- */
 function splitMessageSmart(text, maxParts = 6) {
   const t = (text || "").trim();
   if (!t) return ["..."];
@@ -97,7 +97,7 @@ function splitMessageSmart(text, maxParts = 6) {
 }
 
 function assertEnv() {
-  const needed = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "OPENAI_API_KEY"];
+  const needed = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "OPENAI_API_KEY", "REDIS_URL"];
   const missing = needed.filter((k) => !process.env[k]);
   if (missing.length) throw new Error("Missing env vars: " + missing.join(", "));
 }
@@ -142,25 +142,67 @@ async function sendWhatsAppText({ to, bodyText, trace }) {
   return { ok: r.ok, status: r.status, dataText };
 }
 
-function ensureSession(from) {
-  if (!sessions.has(from)) {
-    sessions.set(from, {
+/* =========================
+   Redis helpers (sessão + dedup)
+   ========================= */
+async function kvGetSession(from) {
+  const r = await getRedis();
+  const raw = await r.get(keySess(from));
+  if (!raw) return null;
+
+  // refresh TTL
+  await r.expire(keySess(from), SESSION_TTL_SECONDS);
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function kvSetSession(from, sessObj) {
+  const r = await getRedis();
+  await r.set(keySess(from), JSON.stringify(sessObj), { EX: SESSION_TTL_SECONDS });
+}
+
+async function kvDelSession(from) {
+  const r = await getRedis();
+  await r.del(keySess(from));
+}
+
+/**
+ * Dedup ATÔMICO (perfeito pra serverless):
+ * SET key value NX EX ttl
+ * Retorna true se já tinha sido visto.
+ */
+async function seenRecently(msgId) {
+  if (!msgId) return false;
+  const r = await getRedis();
+  const ok = await r.set(keySeen(msgId), "1", { NX: true, EX: DEDUP_TTL_SECONDS });
+  return ok === null;
+}
+
+async function ensureSession(from) {
+  let sess = await kvGetSession(from);
+  if (!sess) {
+    sess = {
       history: [],
       state: {
         mode: "mentor", // "mentor" | "calc"
         calc: null,
-        pendingLong: null, // { fullText, parts[] }
-        pendingCalcConfirm: false, // aguardando "1/2" ou "sim/não"
+        pendingLong: null,
+        pendingCalcConfirm: false,
       },
-    });
+      _lastTs: Date.now(),
+    };
   }
-  const sess = sessions.get(from);
   sess._lastTs = Date.now();
+  await kvSetSession(from, sess);
   return sess;
 }
 
 /* =========================
-   Feedback de input inválido (evita “silêncio”/travamento)
+   Helpers: input inválido calc
    ========================= */
 async function sendCalcInvalid({ to, trace, msg, prompt }) {
   const text =
@@ -273,7 +315,6 @@ function parseKitWeights(text) {
   return null;
 }
 
-// 30x10x0,5cm / 3x0,9x0,02m / 300x90x2 (assume cm)
 function parseDims3Inline(text) {
   const raw = (text || "").toString().trim().toLowerCase().replace(/\s+/g, "");
   const t = raw.replace(",", ".");
@@ -433,7 +474,7 @@ Quer calcular outra peça? É só me dizer "quero calcular" 🙂`
 }
 
 /* =========================
-   MODO “PLANO” (respostas longas)
+   MODO “PLANO”
    ========================= */
 function isContinueText(t) {
   const s = normalizeLoose(t);
@@ -459,7 +500,7 @@ function looksLikePlanRequest(t) {
 }
 
 /* =========================
-   ✅ ÁUDIO: WhatsApp -> baixar mídia -> transcrever (OpenAI) -> virar texto
+   ÁUDIO: WhatsApp -> baixar mídia -> transcrever (OpenAI)
    ========================= */
 async function getWhatsAppMediaMeta(mediaId, trace) {
   const url = `https://graph.facebook.com/v22.0/${mediaId}`;
@@ -477,8 +518,7 @@ async function getWhatsAppMediaMeta(mediaId, trace) {
     console.log("❌ Media meta error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
     return null;
   }
-  // esperado: { url, mime_type, sha256, file_size, id }
-  return data;
+  return data; // { url, mime_type, ... }
 }
 
 async function downloadWhatsAppMediaFile(mediaUrl, trace) {
@@ -502,26 +542,20 @@ async function downloadWhatsAppMediaFile(mediaUrl, trace) {
 }
 
 async function transcribeWithOpenAI({ arrayBuffer, contentType, trace }) {
-  // Modelo de transcrição (padrão: whisper-1)
   const model = process.env.OPENAI_TRANSCRIBE_MODEL || "whisper-1";
 
   const form = new FormData();
   const blob = new Blob([arrayBuffer], { type: contentType });
-
-  // filename ajuda a API a aceitar melhor
   const filename = contentType.includes("ogg") ? "audio.ogg" : "audio.bin";
 
   form.append("model", model);
   form.append("file", blob, filename);
-  // form.append("language", "pt"); // opcional (se quiser travar pt)
 
   const r = await fetchWithTimeout(
     "https://api.openai.com/v1/audio/transcriptions",
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
       body: form,
     },
     25000
@@ -529,11 +563,7 @@ async function transcribeWithOpenAI({ arrayBuffer, contentType, trace }) {
 
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
-    console.log("❌ OpenAI transcription error:", {
-      trace,
-      status: r.status,
-      data: JSON.stringify(data).slice(0, 900),
-    });
+    console.log("❌ OpenAI transcription error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
     return null;
   }
 
@@ -548,13 +578,11 @@ async function transcribeWhatsAppAudio({ mediaId, trace }) {
   const file = await downloadWhatsAppMediaFile(meta.url, trace);
   if (!file?.arrayBuffer) return null;
 
-  const transcript = await transcribeWithOpenAI({
+  return await transcribeWithOpenAI({
     arrayBuffer: file.arrayBuffer,
     contentType: meta.mime_type || file.contentType,
     trace,
   });
-
-  return transcript;
 }
 
 /* =========================
@@ -594,17 +622,15 @@ BASE TÉCNICA (resumo)
 
 REGRA IMPORTANTE SOBRE CÁLCULOS
 - Se o usuário pedir cálculo de volume/quantidade de resina/quanto vai de resina/endurecedor, NÃO faça conta manual no texto.
-- Em vez disso, ofereça a "Calculadora exclusiva da Universidade da Resina" e peça confirmação (sim/não), porque ela calcula certo com densidade e proporção do kit.
+- Em vez disso, ofereça a "Calculadora exclusiva da Universidade da Resina" e peça confirmação (sim/não).
 
 PLANOS LONGOS
 Quando o usuário pedir um PLANO/GUIA/CHECKLIST longo:
 1) responda primeiro com um RESUMO curto (7–10 linhas)
 2) finalize com: "Quer que eu detalhe em partes? (sim/continuar)"
-Não escreva o plano inteiro de uma vez na primeira resposta.
 
 REGRAS
 - Não invente dados específicos de marca/linha. Se precisar, peça rótulo/ficha técnica.
-- Quando for recomendação geral, deixe claro ("como regra geral...").
 - Termine com UMA pergunta prática que avance o caso.
 
 Horário (SP): ${spTime}
@@ -612,11 +638,7 @@ Horário (SP): ${spTime}
 
   const payload = {
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    messages: [
-      { role: "system", content: system },
-      ...history,
-      { role: "user", content: userText },
-    ],
+    messages: [{ role: "system", content: system }, ...history, { role: "user", content: userText }],
     temperature: 0.55,
   };
 
@@ -639,8 +661,8 @@ Horário (SP): ${spTime}
     return "Entendi, meu amigo. Quer usar a Calculadora exclusiva pra eu calcular certinho? (1) Sim (2) Não";
   }
 
-  const reply = data?.choices?.[0]?.message?.content?.trim();
-  return reply || "Entendi, meu amigo. Quer usar a Calculadora exclusiva pra eu calcular certinho? (1) Sim (2) Não";
+  return data?.choices?.[0]?.message?.content?.trim()
+    || "Entendi, meu amigo. Quer usar a Calculadora exclusiva pra eu calcular certinho? (1) Sim (2) Não";
 }
 
 /* =========================
@@ -673,45 +695,21 @@ export default async function handler(req, res) {
     const msgId = msg.id;
     const trace = `${from}:${msgId || "noid"}`;
 
-    cleanupMap(processed, 10 * 60 * 1000);
-    cleanupSessions();
-
-    if (seenRecently(msgId)) return res.status(200).json({ ok: true });
+    // Dedup global (Redis)
+    if (await seenRecently(msgId)) return res.status(200).json({ ok: true });
 
     if (msg.type === "sticker") return res.status(200).json({ ok: true });
 
-    const sess = ensureSession(from);
+    // sessão persistente
+    const sess = await ensureSession(from);
 
-    // comando de reset
-    if (msg.type === "text" && (msg.text?.body || "").trim().toLowerCase() === "#reset") {
-      sessions.delete(from);
-      const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
-      await sleep(humanDelayMs(ok));
-      await sendWhatsAppText({ to: from, bodyText: ok, trace });
-      return res.status(200).json({ ok: true });
-    }
-
-    // manter #calc pra debug/teste
-    if (msg.type === "text" && (msg.text?.body || "").trim().toLowerCase() === "#calc") {
-      sess.state.mode = "calc";
-      sess.state.calc = { shape: null, kit: null, inlineTried: false };
-      sess.state.pendingCalcConfirm = false;
-      const prompt = calcNextPrompt(sess.state.calc);
-      await sleep(humanDelayMs(prompt));
-      await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-      return res.status(200).json({ ok: true });
-    }
-
-    // =========
-    // ✅ Captura texto do usuário (se vier por áudio, transcreve)
-    // =========
+    // Captura texto (ou transcreve áudio)
     let userText = "";
 
     if (msg.type === "text") {
       userText = msg.text?.body?.trim() || "";
       if (!userText) return res.status(200).json({ ok: true });
     } else if (msg.type === "audio") {
-      // WhatsApp voice note / audio
       const mediaId = msg.audio?.id;
       if (!mediaId) {
         const quick = "Não consegui acessar esse áudio 😅 Me manda em texto rapidinho?";
@@ -726,26 +724,48 @@ export default async function handler(req, res) {
 
       const transcript = await transcribeWhatsAppAudio({ mediaId, trace });
       if (!transcript) {
-        const fail = "Deu ruim pra transcrever esse áudio 😅 Pode mandar de novo (mais pertinho do microfone) ou escrever em texto?";
+        const fail =
+          "Deu ruim pra transcrever esse áudio 😅 Pode mandar de novo (mais pertinho do microfone) ou escrever em texto?";
         await sleep(humanDelayMs(fail));
         await sendWhatsAppText({ to: from, bodyText: fail, trace });
         return res.status(200).json({ ok: true });
       }
 
       userText = transcript.trim();
-
-      // opcional: guardar no histórico com marca de áudio
-      sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText}` });
+      // evita inflar histórico
+      sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText.slice(0, 1200)}` });
       if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
     } else {
-      // outros tipos (imagem, documento, etc.)
       const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou manda um áudio).";
       await sleep(humanDelayMs(quick));
       await sendWhatsAppText({ to: from, bodyText: quick, trace });
       return res.status(200).json({ ok: true });
     }
 
-    // Se tiver “plano em partes” pendente e pedir continuar
+    // reset
+    if (normalizeLoose(userText) === "#reset") {
+      await kvDelSession(from);
+      const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
+      await sleep(humanDelayMs(ok));
+      await sendWhatsAppText({ to: from, bodyText: ok, trace });
+      return res.status(200).json({ ok: true });
+    }
+
+    // debug calc
+    if (normalizeLoose(userText) === "#calc") {
+      sess.state.mode = "calc";
+      sess.state.calc = { shape: null, kit: null, inlineTried: false };
+      sess.state.pendingCalcConfirm = false;
+
+      const prompt = calcNextPrompt(sess.state.calc);
+      await sleep(humanDelayMs(prompt));
+      await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+      await kvSetSession(from, sess);
+      return res.status(200).json({ ok: true });
+    }
+
+    // Continuação de plano em partes
     if (sess.state.pendingLong && isContinueText(userText)) {
       const p = sess.state.pendingLong.parts;
       const next = p.splice(0, 2);
@@ -760,10 +780,12 @@ export default async function handler(req, res) {
         await sleep(humanDelayMs(ask));
         await sendWhatsAppText({ to: from, bodyText: ask, trace });
       }
+
+      await kvSetSession(from, sess);
       return res.status(200).json({ ok: true });
     }
 
-    // Se o usuário mencionou cálculo e NÃO está no modo calc, oferecer a calculadora
+    // Oferta calculadora
     if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
       sess.state.pendingCalcConfirm = true;
 
@@ -775,10 +797,12 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
 2) Não, só uma orientação`;
       await sleep(humanDelayMs(offer));
       await sendWhatsAppText({ to: from, bodyText: offer, trace });
+
+      await kvSetSession(from, sess);
       return res.status(200).json({ ok: true });
     }
 
-    // Se estava aguardando confirmação da calculadora
+    // Confirmação calculadora
     if (sess.state.pendingCalcConfirm) {
       if (isYes(userText)) {
         sess.state.pendingCalcConfirm = false;
@@ -788,16 +812,20 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         const prompt = calcNextPrompt(sess.state.calc);
         await sleep(humanDelayMs(prompt));
         await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+        await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
       }
 
       if (isNo(userText)) {
         sess.state.pendingCalcConfirm = false;
-        // segue modo mentor normal
+        // segue mentor
       } else {
         const again = "Só pra eu entender: quer usar a calculadora? Responde 1 (sim) ou 2 (não).";
         await sleep(humanDelayMs(again));
         await sendWhatsAppText({ to: from, bodyText: again, trace });
+
+        await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
       }
     }
@@ -819,16 +847,19 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
           const again = buildCalcMenu();
           await sleep(humanDelayMs(again));
           await sendWhatsAppText({ to: from, bodyText: again, trace });
+
+          await kvSetSession(from, sess);
           return res.status(200).json({ ok: true });
         }
 
         const prompt = calcNextPrompt(calc);
         await sleep(humanDelayMs(prompt));
         await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+        await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
       }
 
-      // helper: seta medida com parser e avisa se inválido
       const setLenOrWarn = async (key, parserFn, msg, prompt) => {
         const v = parserFn(userText);
         if (v == null || v <= 0) {
@@ -839,7 +870,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         return true;
       };
 
-      // Retângulo: tentar inline 30x10x0,5cm antes das perguntas separadas
+      // Retângulo: tentar inline antes
       if (calc.shape === "retangulo" && !calc.inlineTried) {
         calc.inlineTried = true;
 
@@ -849,11 +880,9 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
           calc.l_cm = inline.l_cm;
           calc.a_cm = inline.a_cm;
 
-          // se mandar o kit junto no mesmo texto, captura também
           const kitInline = parseKitWeights(userText);
           if (kitInline) calc.kit = kitInline;
         } else {
-          // se não veio "CxLxA", tenta pegar pelo menos o comprimento
           const c = parseLengthToCm(userText);
           if (c) calc.c_cm = c;
           else {
@@ -863,6 +892,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
               msg: "Não consegui entender essas medidas 😅",
               prompt: "Me manda assim: 30x10x0,5cm (ou me diz o comprimento, ex: 30cm):",
             });
+            await kvSetSession(from, sess);
             return res.status(200).json({ ok: true });
           }
         }
@@ -870,49 +900,49 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         if (calc.shape === "retangulo") {
           if (calc.c_cm == null) {
             const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento? (ex: 30cm ou 3m)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.l_cm == null) {
             const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", "Largura? (ex: 10cm ou 0,8m)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.a_cm == null) {
             const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura/espessura 😅", "Altura/espessura? (ex: 0,5cm ou 5mm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
 
         if (calc.shape === "cilindro") {
           if (calc.diam_cm == null) {
             const ok = await setLenOrWarn("diam_cm", parseLengthToCm, "Não consegui entender o diâmetro 😅", "Diâmetro? (ex: 10cm ou 0,3m)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.a_cm == null) {
             const ok = await setLenOrWarn("a_cm", parseLengthToCm, "Não consegui entender a altura 😅", "Altura/profundidade? (ex: 3cm ou 30mm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
 
         if (calc.shape === "triangular") {
           if (calc.base_cm == null) {
             const ok = await setLenOrWarn("base_cm", parseLengthToCm, "Não consegui entender a base do triângulo 😅", "Base do triângulo? (ex: 12cm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.alttri_cm == null) {
             const ok = await setLenOrWarn("alttri_cm", parseLengthToCm, "Não consegui entender a altura do triângulo 😅", "Altura do triângulo? (ex: 8cm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.comp_cm == null) {
             const ok = await setLenOrWarn("comp_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento do prisma? (ex: 40cm ou 1,2m)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
 
         if (calc.shape === "camada") {
           if (calc.c_cm == null) {
             const ok = await setLenOrWarn("c_cm", parseLengthToCm, "Não consegui entender o comprimento 😅", "Comprimento da área? (ex: 1m ou 30cm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.l_cm == null) {
             const ok = await setLenOrWarn("l_cm", parseLengthToCm, "Não consegui entender a largura 😅", "Largura da área? (ex: 0,5m ou 20cm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           } else if (calc.esp_cm == null) {
             const ok = await setLenOrWarn("esp_cm", parseLengthToCm, "Não consegui entender a espessura 😅", "Espessura? (ex: 1mm, 2mm ou 0,2cm)");
-            if (!ok) return res.status(200).json({ ok: true });
+            if (!ok) { await kvSetSession(from, sess); return res.status(200).json({ ok: true }); }
           }
         }
       }
@@ -923,7 +953,6 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         (calc.shape === "triangular" && calc.base_cm != null && calc.alttri_cm != null && calc.comp_cm != null) ||
         (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
-      // Se medidas completas mas kit ainda não veio, pede kit.
       if (measuresComplete && !calc.kit) {
         const kit = parseKitWeights(userText);
         if (kit) {
@@ -932,6 +961,8 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
           const prompt = calcNextPrompt(calc);
           await sleep(humanDelayMs(prompt));
           await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+          await kvSetSession(from, sess);
           return res.status(200).json({ ok: true });
         }
       }
@@ -946,32 +977,33 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
           await sleep(humanDelayMs(part));
           await sendWhatsAppText({ to: from, bodyText: part, trace });
         }
+
+        await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
       }
 
       const prompt = calcNextPrompt(calc);
       await sleep(humanDelayMs(prompt));
       await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+      await kvSetSession(from, sess);
       return res.status(200).json({ ok: true });
     }
 
     /* =========================
-       MODO MENTOR (normal)
+       MODO MENTOR
        ========================= */
     const replyText = await getAIReply({ history: sess.history, userText, trace });
 
-    // salva histórico (se não foi áudio já pré-salvo)
-    if (!(msg.type === "audio")) {
+    // salva histórico (se não foi áudio, ainda não salvou o userText)
+    if (msg.type !== "audio") {
       sess.history.push({ role: "user", content: userText });
     }
     sess.history.push({ role: "assistant", content: replyText });
     if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
 
     const parts = splitMessageSmart(replyText, 6);
-
-    const shouldChunkLong =
-      looksLikePlanRequest(userText) ||
-      (replyText && replyText.length > 1600);
+    const shouldChunkLong = looksLikePlanRequest(userText) || (replyText && replyText.length > 1600);
 
     if (shouldChunkLong && parts.length > 2) {
       const first = parts.slice(0, 2);
@@ -988,6 +1020,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
       await sleep(humanDelayMs(ask));
       await sendWhatsAppText({ to: from, bodyText: ask, trace });
 
+      await kvSetSession(from, sess);
       return res.status(200).json({ ok: true });
     }
 
@@ -996,6 +1029,7 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
       await sendWhatsAppText({ to: from, bodyText: part, trace });
     }
 
+    await kvSetSession(from, sess);
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.log("❌ Handler error:", err);
