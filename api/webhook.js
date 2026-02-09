@@ -101,7 +101,6 @@ function splitMessageSmart(text, maxParts = 6) {
   return finalParts;
 }
 
-
 function assertEnv() {
   const needed = ["VERIFY_TOKEN", "WHATSAPP_TOKEN", "PHONE_NUMBER_ID", "OPENAI_API_KEY", "REDIS_URL"];
   const missing = needed.filter((k) => !process.env[k]);
@@ -234,6 +233,16 @@ async function ensureSession(from) {
     sess.state.pendingCalcConfirm ??= false;
     sess.state.pendingImage ??= null;
     sess.state.humanHandoffUntil ??= 0;
+  }
+
+  // compat calc novos campos
+  if (sess.state.calc) {
+    sess.state.calc.kit ??= { resinG: null, hardG: null };
+    if (sess.state.calc.kit && typeof sess.state.calc.kit === "object") {
+      sess.state.calc.kit.resinG ??= null;
+      sess.state.calc.kit.hardG ??= null;
+    }
+    sess.state.calc.pendingUnit ??= null;
   }
 
   sess._lastTs = Date.now();
@@ -419,7 +428,7 @@ function isCalcIntent(text) {
     "ml",
   ];
 
-  const hasDimsInline = /(\d+([.,]\d+)?x){2}\d+([.,]\d+)?(mm|cm|m)?\b/i.test(text);
+  const hasDimsInline = /(\d+([.,]\d+)?x){2}\d+([.,]\d+)?(mm|cm|m)\b/i.test(text); // ✅ exige unidade
   if (hasDimsInline) return true;
 
   return keywords.some((k) => s.includes(normalizeLoose(k)));
@@ -431,27 +440,61 @@ function isCalcIntent(text) {
 const DENSITY_KG_PER_L = 1.10;
 const PI = Math.PI;
 
-function parseLengthToCm(input) {
+function isBareNumber(input) {
   const t = (input || "").toString().trim().toLowerCase().replace(",", ".");
-  const m = t.match(/(\d+(\.\d+)?)(mm|cm|m)?/);
-  if (!m) return null;
-  const val = Number(m[1]);
+  return /^(\d+(\.\d+)?)$/.test(t);
+}
+
+function parseUnitOnly(input) {
+  const s = normalizeLoose(input);
+  if (s === "mm" || s === "milimetro" || s === "milimetros") return "mm";
+  if (s === "cm" || s === "centimetro" || s === "centimetros") return "cm";
+  if (s === "m" || s === "metro" || s === "metros") return "m";
+
+  if (s === "g" || s === "grama" || s === "gramas") return "g";
+  if (s === "kg" || s === "quilo" || s === "quilos" || s === "kilograma" || s === "kilogramas") return "kg";
+
+  return null;
+}
+
+function applyUnitToBareNumber(numStr, unit) {
+  const val = Number((numStr || "").toString().replace(",", "."));
   if (!Number.isFinite(val) || val <= 0) return null;
-  const unit = (m[3] || "cm").toLowerCase();
+
   if (unit === "m") return val * 100;
   if (unit === "mm") return val / 10;
-  return val;
+  if (unit === "cm") return val;
+
+  if (unit === "kg") return val * 1000;
+  if (unit === "g") return val;
+
+  return null;
+}
+
+function parseLengthToCm(input) {
+  const t = (input || "").toString().trim().toLowerCase().replace(",", ".");
+  const m = t.match(/^(\d+(\.\d+)?)(mm|cm|m)$/); // ✅ exige unidade
+  if (!m) return null;
+
+  const val = Number(m[1]);
+  if (!Number.isFinite(val) || val <= 0) return null;
+
+  const unit = m[3];
+  if (unit === "m") return val * 100;
+  if (unit === "mm") return val / 10;
+  return val; // cm
 }
 
 function parseWeightToG(input) {
   const t = (input || "").toString().trim().toLowerCase().replace(",", ".");
-  const m = t.match(/(\d+(\.\d+)?)(kg|g)?/);
+  const m = t.match(/^(\d+(\.\d+)?)(kg|g)$/); // ✅ exige unidade
   if (!m) return null;
+
   const val = Number(m[1]);
   if (!Number.isFinite(val) || val <= 0) return null;
-  const unit = (m[3] || "g").toLowerCase();
-  if (unit === "kg") return val * 1000;
-  return val;
+
+  const unit = m[3];
+  return unit === "kg" ? val * 1000 : val;
 }
 
 function parseKitWeights(text) {
@@ -469,11 +512,11 @@ function parseDims3Inline(text) {
   const raw = (text || "").toString().trim().toLowerCase().replace(/\s+/g, "");
   const t = raw.replace(",", ".");
 
-  let unit = null;
   const unitMatch = t.match(/(mm|cm|m)$/);
-  if (unitMatch) unit = unitMatch[1];
+  if (!unitMatch) return null; // ✅ exige unidade
+  const unit = unitMatch[1];
 
-  const core = unit ? t.slice(0, -unit.length) : t;
+  const core = t.slice(0, -unit.length);
   const parts = core.split("x").filter(Boolean);
   if (parts.length !== 3) return null;
 
@@ -508,7 +551,7 @@ function formatG(g) {
 function computeVolumeLiters(calc) {
   const shape = calc.shape;
 
-  if (shape === "retangulo") {
+  if (shape === "retangulo" || shape === "canaleta") {
     const cm3 = calc.c_cm * calc.l_cm * calc.a_cm;
     return litersFromCm3(cm3);
   }
@@ -529,65 +572,56 @@ function computeVolumeLiters(calc) {
 }
 
 function buildCalcMenu() {
-  return `🧮 Calculadora exclusiva (Universidade da Resina)
+  return `🧮 Calculadora exclusiva de Alunos:
 
-Escolhe o formato:
-1) Retângulo (C x L x A)
-2) Cilindro (diâmetro x altura)
-3) Prisma triangular (base x altura do triângulo x comprimento)
-4) Camada superficial (C x L x espessura)
+Escolha o formato:
 
-📌 Dica: no retângulo você pode mandar tudo em uma linha:
-"30x10x0,5cm" ou "3x0,9x0,02m"
+1) Retângulo (exemplo: rio de resina)
+2) Cilindro (ex: mesa redonda)
+3) Canaleta Tábua
+4) Camada superficial
 
-Responde só com o número (1 a 4) 🙂`;
+📌 Responda só com o número (1 a 4)`;
 }
 
 function calcNextPrompt(calc) {
   if (!calc.shape) return buildCalcMenu();
 
+  // ✅ Retângulo (sequencial)
   if (calc.shape === "retangulo") {
-    if (!calc.inlineTried) {
-      return `Me manda as medidas. Pode ser assim:
-- Tudo junto: 30x10x0,5cm
-ou
-- Separado: comprimento (ex: 30cm ou 3m)
+    if (calc.c_cm == null) return "Qual o comprimento? (mande o valor e a medida, ex: 30cm)";
+    if (calc.l_cm == null) return "Qual a largura? (ex: 10cm)";
+    if (calc.a_cm == null) return "Qual a espessura/altura? (ex: 0,5cm ou 5mm)";
+  }
 
-(Se quiser sair da calculadora: manda "sair")`;
-    }
-    if (calc.c_cm == null) return 'Comprimento? (ex: 30cm ou 3m) — ou manda "sair"';
-    if (calc.l_cm == null) return 'Largura? (ex: 10cm ou 0,8m) — ou manda "sair"';
-    if (calc.a_cm == null) return 'Altura/espessura? (ex: 0,5cm ou 5mm) — ou manda "sair"';
+  // ✅ Canaleta (sequencial)
+  if (calc.shape === "canaleta") {
+    if (calc.c_cm == null) return "Qual o comprimento da canaleta? (ex: 30cm)";
+    if (calc.l_cm == null) return "Qual a largura da canaleta? (ex: 2cm)";
+    if (calc.a_cm == null) return "Qual a profundidade da canaleta? (ex: 1cm)";
   }
 
   if (calc.shape === "cilindro") {
-    if (calc.diam_cm == null) return 'Diâmetro? (ex: 10cm ou 0,3m) — ou manda "sair"';
-    if (calc.a_cm == null) return 'Altura/profundidade? (ex: 3cm ou 30mm) — ou manda "sair"';
+    if (calc.diam_cm == null) return "Qual o diâmetro? (ex: 10cm)";
+    if (calc.a_cm == null) return "Qual a altura/profundidade? (ex: 3cm)";
   }
 
   if (calc.shape === "triangular") {
-    if (calc.base_cm == null) return 'Base do triângulo? (ex: 12cm) — ou manda "sair"';
-    if (calc.alttri_cm == null) return 'Altura do triângulo? (ex: 8cm) — ou manda "sair"';
-    if (calc.comp_cm == null) return 'Comprimento do prisma? (ex: 40cm ou 1,2m) — ou manda "sair"';
+    if (calc.base_cm == null) return "Qual a base do triângulo? (ex: 12cm)";
+    if (calc.alttri_cm == null) return "Qual a altura do triângulo? (ex: 8cm)";
+    if (calc.comp_cm == null) return "Qual o comprimento do prisma? (ex: 40cm)";
   }
 
   if (calc.shape === "camada") {
-    if (calc.c_cm == null) return 'Comprimento da área? (ex: 1m ou 30cm) — ou manda "sair"';
-    if (calc.l_cm == null) return 'Largura da área? (ex: 0,5m ou 20cm) — ou manda "sair"';
-    if (calc.esp_cm == null) return 'Espessura? (ex: 1mm, 2mm ou 0,2cm) — ou manda "sair"';
+    if (calc.c_cm == null) return "Qual o comprimento da área? (ex: 1m ou 30cm)";
+    if (calc.l_cm == null) return "Qual a largura da área? (ex: 0,5m ou 20cm)";
+    if (calc.esp_cm == null) return "Qual a espessura? (ex: 1mm ou 0,2cm)";
   }
 
-  if (!calc.kit) {
-    return `Agora me diz o KIT pra eu achar a proporção certinha:
-
-➡️ Quanto veio de RESINA e quanto veio de ENDURECEDOR?
-Exemplos:
-- "1kg e 500g"
-- "1000g e 120g"
-- "1,2kg e 300g"
-
-(Se quiser sair da calculadora: manda "sair")`;
-  }
+  // ✅ KIT separado (A depois B)
+  calc.kit ??= { resinG: null, hardG: null };
+  if (calc.kit.resinG == null) return "Quanto veio de *Resina (Componente A)*? (ex: 1kg ou 500g)";
+  if (calc.kit.hardG == null) return "E quanto veio de *Endurecedor (Componente B)*? (ex: 120g ou 0,12kg)";
 
   return null;
 }
@@ -604,19 +638,13 @@ function finishCalcMessage(calc) {
   const resin_g = gTotal * (resinParts / totalParts);
   const hard_g = gTotal * (hardParts / totalParts);
 
-  const ratioApprox = resinParts / hardParts;
-  const ratioText = ratioApprox > 0 ? `≈ ${ratioApprox.toFixed(2).replace(".", ",")}:1` : "—";
-
   return `✅ Cálculo pronto
 
-⚖️ Total aproximado: ${formatKg(kgTotal)} (${formatG(gTotal)})
+⚖️ *Total aproximado*: ${formatKg(kgTotal)} (${formatG(gTotal)})
 
 🧪 Mistura (baseado no seu KIT):
-- Resina: ${formatG(resin_g)}
-- Endurecedor: ${formatG(hard_g)}
-(razão RESINA:ENDURECEDOR ${ratioText})
-
-💡 Dica: se for madeira (selagem fraca, frestas, perda no copo), faz ~10% a mais pra garantir. Se for molde silicone bem fechado, dá pra seguir mais “no alvo”.
+- *Resina*: ${formatG(resin_g)}
+- *Endurecedor*: ${formatG(hard_g)}
 
 Quer calcular outra peça? É só me dizer "quero calcular" 🙂`;
 }
@@ -1228,7 +1256,11 @@ Como posso te chamar? 🙂`;
        ========================= */
     if (normalizeLoose(userText) === "#calc") {
       sess.state.mode = "calc";
-      sess.state.calc = { shape: null, kit: null, inlineTried: false };
+      sess.state.calc = {
+        shape: null,
+        kit: { resinG: null, hardG: null },
+        pendingUnit: null, // { kind:"len"|"weight", key:"c_cm|l_cm|a_cm|...", raw:"30" }
+      };
       sess.state.pendingCalcConfirm = false;
 
       const prompt = calcNextPrompt(sess.state.calc);
@@ -1269,7 +1301,12 @@ Como posso te chamar? 🙂`;
       const inlineDims = parseDims3Inline(userText);
       if (inlineDims) {
         sess.state.mode = "calc";
-        sess.state.calc = { shape: "retangulo", kit: null, inlineTried: true, ...inlineDims };
+        sess.state.calc = {
+          shape: "retangulo",
+          kit: { resinG: null, hardG: null },
+          pendingUnit: null,
+          ...inlineDims,
+        };
         sess.state.pendingCalcConfirm = false;
 
         const prompt = calcNextPrompt(sess.state.calc);
@@ -1282,8 +1319,7 @@ Como posso te chamar? 🙂`;
 
       sess.state.pendingCalcConfirm = true;
 
-      const offer = `🧮 Quer usar a Calculadora exclusiva da Universidade da Resina?
-Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina/endurecedor).
+      const offer = `🧮 Quer usar a *Calculadora de Resina* agora?
 
 1) Sim, quero calcular
 2) Não, só uma orientação
@@ -1300,7 +1336,11 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
       if (isYes(userText)) {
         sess.state.pendingCalcConfirm = false;
         sess.state.mode = "calc";
-        sess.state.calc = { shape: null, kit: null, inlineTried: false };
+        sess.state.calc = {
+          shape: null,
+          kit: { resinG: null, hardG: null },
+          pendingUnit: null,
+        };
 
         const prompt = calcNextPrompt(sess.state.calc);
         await sleep(humanDelayMs(prompt));
@@ -1329,6 +1369,9 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
     if (sess.state.mode === "calc" && sess.state.calc) {
       const calc = sess.state.calc;
 
+      calc.kit ??= { resinG: null, hardG: null };
+      calc.pendingUnit ??= null;
+
       // ✅ escape dentro do modo calc (extra segurança)
       if (isEscapeCalc(userText)) {
         sess.state.mode = "mentor";
@@ -1343,11 +1386,46 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         return res.status(200).json({ ok: true });
       }
 
+      // ✅ Se estamos aguardando unidade (mm/cm/m ou g/kg)
+      if (calc.pendingUnit) {
+        const u = parseUnitOnly(userText);
+
+        const isLen = calc.pendingUnit.kind === "len";
+        const isWeight = calc.pendingUnit.kind === "weight";
+
+        // valida unidade esperada
+        const okUnit =
+          (isLen && (u === "mm" || u === "cm" || u === "m")) ||
+          (isWeight && (u === "g" || u === "kg"));
+
+        if (!okUnit) {
+          const again = isLen ? "Qual unidade você quis dizer? Responde só: mm, cm ou m" : "Qual unidade você quis dizer? Responde só: g ou kg";
+          await sleep(humanDelayMs(again));
+          await sendWhatsAppText({ to: from, bodyText: again, trace });
+          await kvSetSession(from, sess);
+          return res.status(200).json({ ok: true });
+        }
+
+        const applied = applyUnitToBareNumber(calc.pendingUnit.raw, u);
+        if (applied == null) {
+          calc.pendingUnit = null;
+        } else {
+          if (isLen) {
+            calc[calc.pendingUnit.key] = applied; // cm
+          } else {
+            // weight -> g
+            if (calc.pendingUnit.key === "resinG") calc.kit.resinG = applied;
+            if (calc.pendingUnit.key === "hardG") calc.kit.hardG = applied;
+          }
+          calc.pendingUnit = null;
+        }
+      }
+
       if (!calc.shape) {
         const n = userText.trim();
         if (n === "1") calc.shape = "retangulo";
         else if (n === "2") calc.shape = "cilindro";
-        else if (n === "3") calc.shape = "triangular";
+        else if (n === "3") calc.shape = "canaleta";
         else if (n === "4") calc.shape = "camada";
         else {
           const again = buildCalcMenu();
@@ -1366,8 +1444,30 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         return res.status(200).json({ ok: true });
       }
 
-      const setLenOrWarn = async (key, parserFn, msg, prompt) => {
-        const v = parserFn(userText);
+      const askUnitIfBare = async (kind, key) => {
+        calc.pendingUnit = { kind, key, raw: userText.trim().replace(",", ".") };
+        const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
+        await sleep(humanDelayMs(ask));
+        await sendWhatsAppText({ to: from, bodyText: ask, trace });
+      };
+
+      const setLenOrWarn = async (key, msg, prompt) => {
+        // se veio só número, perguntar unidade
+        if (isBareNumber(userText)) {
+          await askUnitIfBare("len", key);
+          return false;
+        }
+
+        // se veio no formato 30x10x0,5cm durante retângulo/canaleta, aceitamos e preenchemos logo
+        const inline = parseDims3Inline(userText);
+        if (inline && (calc.shape === "retangulo" || calc.shape === "canaleta")) {
+          calc.c_cm = inline.c_cm;
+          calc.l_cm = inline.l_cm;
+          calc.a_cm = inline.a_cm;
+          return true;
+        }
+
+        const v = parseLengthToCm(userText);
         if (v == null || v <= 0) {
           await sendCalcInvalid({ to: from, trace, msg, prompt });
           return false;
@@ -1376,191 +1476,164 @@ Ela calcula certinho com densidade (1,10) e com a proporção do seu kit (resina
         return true;
       };
 
-      if (calc.shape === "retangulo" && !calc.inlineTried) {
-        calc.inlineTried = true;
+      // ======== MEDIDAS (sequencial por shape) ========
 
-        const inline = parseDims3Inline(userText);
-        if (inline) {
-          calc.c_cm = inline.c_cm;
-          calc.l_cm = inline.l_cm;
-          calc.a_cm = inline.a_cm;
-
-          const kitInline = parseKitWeights(userText);
-          if (kitInline) calc.kit = kitInline;
-        } else {
-          const c = parseLengthToCm(userText);
-          if (c) calc.c_cm = c;
-          else {
-            await sendCalcInvalid({
-              to: from,
-              trace,
-              msg: "Não consegui entender essas medidas 😅",
-              prompt: "Me manda assim: 30x10x0,5cm (ou me diz o comprimento, ex: 30cm):",
-            });
+      if (calc.shape === "retangulo") {
+        if (calc.c_cm == null) {
+          const ok = await setLenOrWarn("c_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento? (ex: 30cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.l_cm == null) {
+          const ok = await setLenOrWarn("l_cm", "Não consegui entender a largura 😅", "Qual a largura? (ex: 10cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.a_cm == null) {
+          const ok = await setLenOrWarn("a_cm", "Não consegui entender a espessura/altura 😅", "Qual a espessura/altura? (ex: 0,5cm ou 5mm)");
+          if (!ok) {
             await kvSetSession(from, sess);
             return res.status(200).json({ ok: true });
           }
         }
-      } else {
-        if (calc.shape === "retangulo") {
-          if (calc.c_cm == null) {
-            const ok = await setLenOrWarn(
-              "c_cm",
-              parseLengthToCm,
-              "Não consegui entender o comprimento 😅",
-              'Comprimento? (ex: 30cm ou 3m) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.l_cm == null) {
-            const ok = await setLenOrWarn(
-              "l_cm",
-              parseLengthToCm,
-              "Não consegui entender a largura 😅",
-              'Largura? (ex: 10cm ou 0,8m) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.a_cm == null) {
-            const ok = await setLenOrWarn(
-              "a_cm",
-              parseLengthToCm,
-              "Não consegui entender a altura/espessura 😅",
-              'Altura/espessura? (ex: 0,5cm ou 5mm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
+      }
+
+      if (calc.shape === "canaleta") {
+        if (calc.c_cm == null) {
+          const ok = await setLenOrWarn("c_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento da canaleta? (ex: 30cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.l_cm == null) {
+          const ok = await setLenOrWarn("l_cm", "Não consegui entender a largura 😅", "Qual a largura da canaleta? (ex: 2cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.a_cm == null) {
+          const ok = await setLenOrWarn("a_cm", "Não consegui entender a profundidade 😅", "Qual a profundidade da canaleta? (ex: 1cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
           }
         }
+      }
 
-        if (calc.shape === "cilindro") {
-          if (calc.diam_cm == null) {
-            const ok = await setLenOrWarn(
-              "diam_cm",
-              parseLengthToCm,
-              "Não consegui entender o diâmetro 😅",
-              'Diâmetro? (ex: 10cm ou 0,3m) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.a_cm == null) {
-            const ok = await setLenOrWarn(
-              "a_cm",
-              parseLengthToCm,
-              "Não consegui entender a altura 😅",
-              'Altura/profundidade? (ex: 3cm ou 30mm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
+      if (calc.shape === "cilindro") {
+        if (calc.diam_cm == null) {
+          const ok = await setLenOrWarn("diam_cm", "Não consegui entender o diâmetro 😅", "Qual o diâmetro? (ex: 10cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.a_cm == null) {
+          const ok = await setLenOrWarn("a_cm", "Não consegui entender a altura 😅", "Qual a altura/profundidade? (ex: 3cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
           }
         }
+      }
 
-        if (calc.shape === "triangular") {
-          if (calc.base_cm == null) {
-            const ok = await setLenOrWarn(
-              "base_cm",
-              parseLengthToCm,
-              "Não consegui entender a base do triângulo 😅",
-              'Base do triângulo? (ex: 12cm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.alttri_cm == null) {
-            const ok = await setLenOrWarn(
-              "alttri_cm",
-              parseLengthToCm,
-              "Não consegui entender a altura do triângulo 😅",
-              'Altura do triângulo? (ex: 8cm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.comp_cm == null) {
-            const ok = await setLenOrWarn(
-              "comp_cm",
-              parseLengthToCm,
-              "Não consegui entender o comprimento 😅",
-              'Comprimento do prisma? (ex: 40cm ou 1,2m) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
+      if (calc.shape === "triangular") {
+        if (calc.base_cm == null) {
+          const ok = await setLenOrWarn("base_cm", "Não consegui entender a base 😅", "Qual a base do triângulo? (ex: 12cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.alttri_cm == null) {
+          const ok = await setLenOrWarn("alttri_cm", "Não consegui entender a altura 😅", "Qual a altura do triângulo? (ex: 8cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.comp_cm == null) {
+          const ok = await setLenOrWarn("comp_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento do prisma? (ex: 40cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
           }
         }
+      }
 
-        if (calc.shape === "camada") {
-          if (calc.c_cm == null) {
-            const ok = await setLenOrWarn(
-              "c_cm",
-              parseLengthToCm,
-              "Não consegui entender o comprimento 😅",
-              'Comprimento da área? (ex: 1m ou 30cm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.l_cm == null) {
-            const ok = await setLenOrWarn(
-              "l_cm",
-              parseLengthToCm,
-              "Não consegui entender a largura 😅",
-              'Largura da área? (ex: 0,5m ou 20cm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-          } else if (calc.esp_cm == null) {
-            const ok = await setLenOrWarn(
-              "esp_cm",
-              parseLengthToCm,
-              "Não consegui entender a espessura 😅",
-              'Espessura? (ex: 1mm, 2mm ou 0,2cm) — ou manda "sair"'
-            );
-            if (!ok) {
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
+      if (calc.shape === "camada") {
+        if (calc.c_cm == null) {
+          const ok = await setLenOrWarn("c_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento da área? (ex: 1m ou 30cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.l_cm == null) {
+          const ok = await setLenOrWarn("l_cm", "Não consegui entender a largura 😅", "Qual a largura da área? (ex: 0,5m ou 20cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
+          }
+        } else if (calc.esp_cm == null) {
+          const ok = await setLenOrWarn("esp_cm", "Não consegui entender a espessura 😅", "Qual a espessura? (ex: 1mm ou 0,2cm)");
+          if (!ok) {
+            await kvSetSession(from, sess);
+            return res.status(200).json({ ok: true });
           }
         }
       }
 
       const measuresComplete =
         (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
+        (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
         (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
         (calc.shape === "triangular" && calc.base_cm != null && calc.alttri_cm != null && calc.comp_cm != null) ||
         (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
-      if (measuresComplete && !calc.kit) {
-        const kit = parseKitWeights(userText);
-        if (kit) {
-          calc.kit = kit;
+      // ======== KIT separado (A depois B) ========
+      if (measuresComplete) {
+        // se aluno mandar "1kg e 120g" numa tacada, aceitamos
+        const both = parseKitWeights(userText);
+        if (both) {
+          calc.kit.resinG = both.resinG;
+          calc.kit.hardG = both.hardG;
         } else {
-          const prompt = calcNextPrompt(calc);
-          await sleep(humanDelayMs(prompt));
-          await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+          // A
+          if (calc.kit.resinG == null) {
+            if (isBareNumber(userText)) {
+              await askUnitIfBare("weight", "resinG");
+              await kvSetSession(from, sess);
+              return res.status(200).json({ ok: true });
+            }
 
-          await kvSetSession(from, sess);
-          return res.status(200).json({ ok: true });
+            const g = parseWeightToG(userText);
+            if (!g) {
+              await sendCalcInvalid({ to: from, trace, msg: "Não entendi a quantidade de Resina (A) 😅", prompt: "Exemplo: 1kg ou 500g" });
+              await kvSetSession(from, sess);
+              return res.status(200).json({ ok: true });
+            }
+            calc.kit.resinG = g;
+          }
+          // B
+          else if (calc.kit.hardG == null) {
+            if (isBareNumber(userText)) {
+              await askUnitIfBare("weight", "hardG");
+              await kvSetSession(from, sess);
+              return res.status(200).json({ ok: true });
+            }
+
+            const g = parseWeightToG(userText);
+            if (!g) {
+              await sendCalcInvalid({ to: from, trace, msg: "Não entendi a quantidade de Endurecedor (B) 😅", prompt: "Exemplo: 120g ou 0,12kg" });
+              await kvSetSession(from, sess);
+              return res.status(200).json({ ok: true });
+            }
+            calc.kit.hardG = g;
+          }
         }
       }
 
-      if (measuresComplete && calc.kit) {
+      // se já completou tudo
+      if (measuresComplete && calc.kit?.resinG != null && calc.kit?.hardG != null) {
         const done = finishCalcMessage(calc);
         sess.state.mode = "mentor";
         sess.state.calc = null;
