@@ -1257,227 +1257,202 @@ Como posso te chamar? 🙂`;
     /* =========================
        MODO CALC (100% estável)
        ========================= */
-    if (sess.state.mode === "calc" && sess.state.calc) {
-      const calc = sess.state.calc;
-      calc.kit ??= { resinG: null, hardG: null };
-      calc.pendingUnit ??= null;
+    /* =========================
+   MODO CALC (100% estável) ✅ FIX FINAL
+   ========================= */
+if (sess.state.mode === "calc" && sess.state.calc) {
+  const calc = sess.state.calc;
+  calc.kit ??= { resinG: null, hardG: null };
+  calc.pendingUnit ??= null;
 
-      // ✅ helper: pergunta unidade e ENCERRA request
-      const askUnit = async (kind, key, raw) => {
-        calc.pendingUnit = { kind, key, raw };
-        const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
-        await sleep(humanDelayMs(ask));
-        await sendWhatsAppText({ to: from, bodyText: ask, trace });
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      };
+  // ✅ helper: pergunta unidade e ENCERRA request
+  const askUnit = async (kind, key, raw) => {
+    calc.pendingUnit = { kind, key, raw };
+    const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
+    await sleep(humanDelayMs(ask));
+    await sendWhatsAppText({ to: from, bodyText: ask, trace });
+    await kvSetSession(from, sess);
+    return res.status(200).json({ ok: true });
+  };
 
-      // ✅ FIX GLOBAL: se chegou unidade, aplica e ENCERRA (não pula etapa)
-      if (calc.pendingUnit) {
-        const prev = calc.pendingUnit;
-        const u = parseUnitOnly(userText);
+  // ✅ FIX GLOBAL: se chegou unidade, aplica e ENCERRA (não pula etapa)
+  if (calc.pendingUnit) {
+    const prev = calc.pendingUnit;
+    const u = parseUnitOnly(userText);
 
-        const isLen = prev.kind === "len";
-        const isWeight = prev.kind === "weight";
+    const isLen = prev.kind === "len";
+    const isWeight = prev.kind === "weight";
 
-        const okUnit =
-          (isLen && (u === "mm" || u === "cm" || u === "m")) ||
-          (isWeight && (u === "g" || u === "kg"));
+    const okUnit =
+      (isLen && (u === "mm" || u === "cm" || u === "m")) ||
+      (isWeight && (u === "g" || u === "kg"));
 
-        if (!okUnit) {
-          const again = isLen ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
-          await sleep(humanDelayMs(again));
-          await sendWhatsAppText({ to: from, bodyText: again, trace });
-          await kvSetSession(from, sess);
-          return res.status(200).json({ ok: true });
-        }
+    if (!okUnit) {
+      const again = isLen ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
+      await sleep(humanDelayMs(again));
+      await sendWhatsAppText({ to: from, bodyText: again, trace });
+      await kvSetSession(from, sess);
+      return res.status(200).json({ ok: true });
+    }
 
-        const applied = applyUnitToBareNumber(prev.raw, u);
-        if (applied != null) {
-          if (isLen) calc[prev.key] = applied; // cm
-          else {
-            if (prev.key === "resinG") calc.kit.resinG = applied; // g
-            if (prev.key === "hardG") calc.kit.hardG = applied; // g
-          }
-        }
-
-        calc.pendingUnit = null;
-
-        const next = calcNextPrompt(calc);
-        await sleep(humanDelayMs(next));
-        await sendWhatsAppText({ to: from, bodyText: next, trace });
-
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
+    const applied = applyUnitToBareNumber(prev.raw, u);
+    if (applied != null) {
+      if (isLen) calc[prev.key] = applied; // cm
+      else {
+        if (prev.key === "resinG") calc.kit.resinG = applied; // g
+        if (prev.key === "hardG") calc.kit.hardG = applied; // g
       }
+    }
 
-      // shape selection
-      if (!calc.shape) {
-        const n = userText.trim();
-        if (n === "1") calc.shape = "retangulo";
-        else if (n === "2") calc.shape = "cilindro";
-        else if (n === "3") calc.shape = "canaleta";
-        else if (n === "4") calc.shape = "camada";
-        else {
-          const again = buildCalcMenu();
-          await sleep(humanDelayMs(again));
-          await sendWhatsAppText({ to: from, bodyText: again, trace });
-          await kvSetSession(from, sess);
-          return res.status(200).json({ ok: true });
-        }
+    calc.pendingUnit = null;
 
-        const prompt = calcNextPrompt(calc);
-        await sleep(humanDelayMs(prompt));
-        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
+    const next = calcNextPrompt(calc);
+    await sleep(humanDelayMs(next));
+    await sendWhatsAppText({ to: from, bodyText: next, trace });
 
-      // helper: set length (supports bare number -> ask unit)
-      const setLenOrAsk = async (key, labelMsg) => {
-        if (isBareNumber(userText)) {
-          return await askUnit("len", key, userText.trim().replace(",", "."));
-        }
-        const v = parseLengthToCm(userText);
-        if (v == null) {
-          await sendCalcInvalid({ to: from, trace, msg: `Não consegui entender ${labelMsg} 😅`, prompt: "Manda com unidade: ex 30cm, 1m, 5mm" });
-          await kvSetSession(from, sess);
-          return res.status(200).json({ ok: true });
-        }
-        calc[key] = v;
-        return null;
-      };
+    await kvSetSession(from, sess);
+    return res.status(200).json({ ok: true });
+  }
 
-      // helper: set weight A/B (supports bare number -> ask unit)
-      const setWeightOrAsk = async (key, prettyName) => {
-        if (isBareNumber(userText)) {
-          return await askUnit("weight", key, userText.trim().replace(",", "."));
-        }
-        const g = parseWeightToG(userText);
-        if (g == null) {
-          await sendCalcInvalid({ to: from, trace, msg: `Não consegui entender o ${prettyName} 😅`, prompt: "Manda com unidade: ex 1kg ou 500g" });
-          await kvSetSession(from, sess);
-          return res.status(200).json({ ok: true });
-        }
-        if (key === "resinG") calc.kit.resinG = g;
-        if (key === "hardG") calc.kit.hardG = g;
-        return null;
-      };
+  // shape selection
+  if (!calc.shape) {
+    const n = userText.trim();
+    if (n === "1") calc.shape = "retangulo";
+    else if (n === "2") calc.shape = "cilindro";
+    else if (n === "3") calc.shape = "canaleta";
+    else if (n === "4") calc.shape = "camada";
+    else {
+      const again = buildCalcMenu();
+      await sleep(humanDelayMs(again));
+      await sendWhatsAppText({ to: from, bodyText: again, trace });
+      await kvSetSession(from, sess);
+      return res.status(200).json({ ok: true });
+    }
 
-      // medidas por shape
-      if (calc.shape === "retangulo") {
-        if (calc.c_cm == null) {
-          const r = await setLenOrAsk("c_cm", "o comprimento");
-          if (r) return r;
-        } else if (calc.l_cm == null) {
-          const r = await setLenOrAsk("l_cm", "a largura");
-          if (r) return r;
-        } else if (calc.a_cm == null) {
-          const r = await setLenOrAsk("a_cm", "a espessura/altura");
-          if (r) return r;
-        }
-      }
+    const prompt = calcNextPrompt(calc);
+    await sleep(humanDelayMs(prompt));
+    await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+    await kvSetSession(from, sess);
+    return res.status(200).json({ ok: true });
+  }
 
-      if (calc.shape === "cilindro") {
-        if (calc.diam_cm == null) {
-          const r = await setLenOrAsk("diam_cm", "o diâmetro");
-          if (r) return r;
-        } else if (calc.a_cm == null) {
-          const r = await setLenOrAsk("a_cm", "a altura/profundidade");
-          if (r) return r;
-        }
-      }
+  // ✅ helper: quando salva algo (medida/peso), SEMPRE pergunta o próximo e retorna
+  const commitAndAskNext = async () => {
+    const next = calcNextPrompt(calc);
+    await sleep(humanDelayMs(next));
+    await sendWhatsAppText({ to: from, bodyText: next, trace });
+    await kvSetSession(from, sess);
+    return res.status(200).json({ ok: true });
+  };
 
-      if (calc.shape === "canaleta") {
-        if (calc.c_cm == null) {
-          const r = await setLenOrAsk("c_cm", "o comprimento");
-          if (r) return r;
-        } else if (calc.l_cm == null) {
-          const r = await setLenOrAsk("l_cm", "a largura");
-          if (r) return r;
-        } else if (calc.a_cm == null) {
-          const r = await setLenOrAsk("a_cm", "a profundidade");
-          if (r) return r;
-        }
-      }
+  // helper: set length (supports bare number -> ask unit)
+  const setLenStep = async (key, labelMsg) => {
+    if (isBareNumber(userText)) {
+      return await askUnit("len", key, userText.trim().replace(",", "."));
+    }
+    const v = parseLengthToCm(userText);
+    if (v == null) {
+      await sendCalcInvalid({
+        to: from,
+        trace,
+        msg: `Não consegui entender ${labelMsg} 😅`,
+        prompt: "Manda com unidade: ex 30cm, 1m, 5mm",
+      });
+      await kvSetSession(from, sess);
+      return res.status(200).json({ ok: true });
+    }
+    calc[key] = v;
+    return await commitAndAskNext(); // ✅ RETORNA AQUI (não continua)
+  };
 
-      if (calc.shape === "camada") {
-        if (calc.c_cm == null) {
-          const r = await setLenOrAsk("c_cm", "o comprimento");
-          if (r) return r;
-        } else if (calc.l_cm == null) {
-          const r = await setLenOrAsk("l_cm", "a largura");
-          if (r) return r;
-        } else if (calc.esp_cm == null) {
-          const r = await setLenOrAsk("esp_cm", "a espessura");
-          if (r) return r;
-        }
-      }
+  // helper: set weight A/B (supports bare number -> ask unit)
+  const setWeightStep = async (key, prettyName) => {
+    if (isBareNumber(userText)) {
+      return await askUnit("weight", key, userText.trim().replace(",", "."));
+    }
+    const g = parseWeightToG(userText);
+    if (g == null) {
+      await sendCalcInvalid({
+        to: from,
+        trace,
+        msg: `Não consegui entender o ${prettyName} 😅`,
+        prompt: "Manda com unidade: ex 1kg ou 500g",
+      });
+      await kvSetSession(from, sess);
+      return res.status(200).json({ ok: true });
+    }
+    if (key === "resinG") calc.kit.resinG = g;
+    if (key === "hardG") calc.kit.hardG = g;
+    return await commitAndAskNext(); // ✅ RETORNA AQUI
+  };
 
-      // checar se medidas completas
-      const measuresComplete =
-        (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
-        (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
-        (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
-        (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
+  // ✅ fluxo de medidas por shape (um passo por mensagem)
+  if (calc.shape === "retangulo") {
+    if (calc.c_cm == null) return await setLenStep("c_cm", "o comprimento");
+    if (calc.l_cm == null) return await setLenStep("l_cm", "a largura");
+    if (calc.a_cm == null) return await setLenStep("a_cm", "a espessura/altura");
+  }
 
-      // kit A/B separado
-      if (measuresComplete && calc.kit.resinG == null) {
-        const r = await setWeightOrAsk("resinG", "Componente A (Resina)");
-        if (r) return r;
+  if (calc.shape === "cilindro") {
+    if (calc.diam_cm == null) return await setLenStep("diam_cm", "o diâmetro");
+    if (calc.a_cm == null) return await setLenStep("a_cm", "a altura/profundidade");
+  }
 
-        const next = calcNextPrompt(calc);
-        await sleep(humanDelayMs(next));
-        await sendWhatsAppText({ to: from, bodyText: next, trace });
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
+  if (calc.shape === "canaleta") {
+    if (calc.c_cm == null) return await setLenStep("c_cm", "o comprimento");
+    if (calc.l_cm == null) return await setLenStep("l_cm", "a largura");
+    if (calc.a_cm == null) return await setLenStep("a_cm", "a profundidade");
+  }
 
-      if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG == null) {
-        const r = await setWeightOrAsk("hardG", "Componente B (Endurecedor)");
-        if (r) return r;
+  if (calc.shape === "camada") {
+    if (calc.c_cm == null) return await setLenStep("c_cm", "o comprimento");
+    if (calc.l_cm == null) return await setLenStep("l_cm", "a largura");
+    if (calc.esp_cm == null) return await setLenStep("esp_cm", "a espessura");
+  }
 
-        const next = calcNextPrompt(calc);
-        await sleep(humanDelayMs(next));
-        await sendWhatsAppText({ to: from, bodyText: next, trace });
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
+  // ✅ se medidas completas, começa kit A/B
+  const measuresComplete =
+    (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
+    (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
+    (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
+    (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
-      // finalizar
-      if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG != null) {
-        const done = finishCalcMessage(calc);
+  if (measuresComplete && calc.kit.resinG == null) return await setWeightStep("resinG", "Componente A (Resina)");
+  if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG == null) return await setWeightStep("hardG", "Componente B (Endurecedor)");
 
-        sess.state.mode = "mentor";
-        sess.state.calc = null;
+  // ✅ finalizar
+  if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG != null) {
+    const done = finishCalcMessage(calc);
 
-        const parts = splitMessageSmart(done, 4);
-        for (const part of parts) {
-          await sleep(humanDelayMs(part));
-          await sendWhatsAppText({ to: from, bodyText: part, trace });
-        }
+    sess.state.mode = "mentor";
+    sess.state.calc = null;
 
-        // ✅ menu pós-cálculo (resolve o "quero" bagunçando)
-        sess.state.pendingAfterCalc = true;
-        const ask = `Quer calcular outra peça?
+    const parts = splitMessageSmart(done, 4);
+    for (const part of parts) {
+      await sleep(humanDelayMs(part));
+      await sendWhatsAppText({ to: from, bodyText: part, trace });
+    }
+
+    sess.state.pendingAfterCalc = true;
+    const ask = `Quer calcular outra peça?
 
 1) Sim (calcular outra)
 2) Não (voltar pro mentor)`;
 
-        await sleep(humanDelayMs(ask));
-        await sendWhatsAppText({ to: from, bodyText: ask, trace });
+    await sleep(humanDelayMs(ask));
+    await sendWhatsAppText({ to: from, bodyText: ask, trace });
 
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
+    await kvSetSession(from, sess);
+    return res.status(200).json({ ok: true });
+  }
 
-      // se ainda faltou algo, pergunta o próximo prompt
-      const prompt = calcNextPrompt(calc);
-      await sleep(humanDelayMs(prompt));
-      await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
+  // fallback (não deveria cair aqui, mas garante)
+  const prompt = calcNextPrompt(calc);
+  await sleep(humanDelayMs(prompt));
+  await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+  await kvSetSession(from, sess);
+  return res.status(200).json({ ok: true });
+}
 
     /* =========================
        MODO MENTOR
