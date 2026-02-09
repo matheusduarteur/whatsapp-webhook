@@ -1,14 +1,14 @@
 // /api/webhook.js
-// WhatsApp Cloud API (Vercel) + Severino 🤖 (OpenAI) + Calculadora + Áudio + Imagem + Redis (REDIS_URL)
+// WhatsApp Cloud API (Vercel) + Severino 🤖 (OpenAI) + Calculadora + Áudio + Imagem + Redis
 
 import { createClient } from "redis";
 
 /* =========================
-   Config (Severino / Handoff)
+   Config
    ========================= */
 const SEVERINO_NAME = "Severino 🤖";
-const PROFESSOR_MATHEUS_WA = "https://wa.me/557781365194"; // +55 77 8136-5194
-const HANDOFF_TTL_MS = 2 * 60 * 60 * 1000; // 2h (bot fica quieto pra não competir com humano)
+const PROFESSOR_MATHEUS_WA = "https://wa.me/557781365194";
+const HANDOFF_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
 /* =========================
    Redis (global / lazy)
@@ -68,7 +68,11 @@ function splitMessageSmart(text, maxParts = 6) {
   const MAX = 650;
   if (t.length <= MAX) return [t];
 
-  const lines = t.split("\n").map((s) => s.trim()).filter(Boolean);
+  const lines = t
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const parts = [];
   let buf = "";
 
@@ -97,7 +101,7 @@ function splitMessageSmart(text, maxParts = 6) {
       finalParts[finalParts.length - 1].trim() + "\n\n(Se quiser, eu continuo 🙂)";
   }
 
-  // ✅ SEM prefixo (1/3), (2/3)...
+  // ✅ sem prefixo (1/3) etc.
   return finalParts;
 }
 
@@ -148,14 +152,13 @@ async function sendWhatsAppText({ to, bodyText, trace }) {
 }
 
 /* =========================
-   Redis helpers (sessão + dedup)
+   Redis helpers
    ========================= */
 async function kvGetSession(from) {
   const r = await getRedis();
   const raw = await r.get(keySess(from));
   if (!raw) return null;
 
-  // refresh TTL
   await r.expire(keySess(from), SESSION_TTL_SECONDS);
 
   try {
@@ -175,16 +178,11 @@ async function kvDelSession(from) {
   await r.del(keySess(from));
 }
 
-/**
- * Dedup ATÔMICO (perfeito pra serverless):
- * SET key value NX EX ttl
- * Retorna true se a mensagem é DUPLICADA (já tinha sido vista).
- */
 async function isDuplicateMsg(msgId) {
   if (!msgId) return false;
   const r = await getRedis();
   const result = await r.set(keySeen(msgId), "1", { NX: true, EX: DEDUP_TTL_SECONDS });
-  return result === null; // null => já existia => duplicada
+  return result === null;
 }
 
 async function ensureSession(from) {
@@ -192,57 +190,46 @@ async function ensureSession(from) {
   if (!sess) {
     sess = {
       history: [],
-      profile: {
-        name: null,
-        gender: null, // "m" | "f" | null
-        askedName: false,
-      },
+      profile: { name: null, gender: null, askedName: false },
       state: {
         mode: "mentor", // "mentor" | "calc"
         calc: null,
         pendingLong: null,
         pendingCalcConfirm: false,
-        pendingImage: null, // { mediaId, caption, ts }
-        humanHandoffUntil: 0, // timestamp
+        pendingImage: null,
+        humanHandoffUntil: 0,
+        pendingAfterCalc: false, // ✅ NOVO: menu após cálculo
       },
       _lastTs: Date.now(),
     };
   }
 
-  // compat: se sessão antiga não tinha profile/state novos
-  if (!sess.profile) {
-    sess.profile = { name: null, gender: null, askedName: false };
-  } else {
-    sess.profile.name ??= null;
-    sess.profile.gender ??= null;
-    sess.profile.askedName ??= false;
-  }
-  if (!sess.state) {
-    sess.state = {
-      mode: "mentor",
-      calc: null,
-      pendingLong: null,
-      pendingCalcConfirm: false,
-      pendingImage: null,
-      humanHandoffUntil: 0,
-    };
-  } else {
-    sess.state.mode ??= "mentor";
-    sess.state.calc ??= null;
-    sess.state.pendingLong ??= null;
-    sess.state.pendingCalcConfirm ??= false;
-    sess.state.pendingImage ??= null;
-    sess.state.humanHandoffUntil ??= 0;
-  }
+  sess.profile ??= { name: null, gender: null, askedName: false };
+  sess.profile.name ??= null;
+  sess.profile.gender ??= null;
+  sess.profile.askedName ??= false;
 
-  // compat calc novos campos
+  sess.state ??= {
+    mode: "mentor",
+    calc: null,
+    pendingLong: null,
+    pendingCalcConfirm: false,
+    pendingImage: null,
+    humanHandoffUntil: 0,
+    pendingAfterCalc: false,
+  };
+  sess.state.mode ??= "mentor";
+  sess.state.calc ??= null;
+  sess.state.pendingLong ??= null;
+  sess.state.pendingCalcConfirm ??= false;
+  sess.state.pendingImage ??= null;
+  sess.state.humanHandoffUntil ??= 0;
+  sess.state.pendingAfterCalc ??= false;
+
+  // compat do calc
   if (sess.state.calc) {
     sess.state.calc.kit ??= { resinG: null, hardG: null };
-    if (sess.state.calc.kit && typeof sess.state.calc.kit === "object") {
-      sess.state.calc.kit.resinG ??= null;
-      sess.state.calc.kit.hardG ??= null;
-    }
-    sess.state.calc.pendingUnit ??= null;
+    sess.state.calc.pendingUnit ??= null; // { kind:"len"|"weight", key, raw }
   }
 
   sess._lastTs = Date.now();
@@ -260,7 +247,8 @@ async function sendCalcInvalid({ to, trace, msg, prompt }) {
 - 30cm
 - 0,8m
 - 5mm
-- 30x10x0,5cm
+- 1kg
+- 500g
 
 ${prompt}`;
   const parts = splitMessageSmart(text, 4);
@@ -360,15 +348,10 @@ function wantsHuman(text) {
     "falar com o matheus",
     "falar com professor",
     "falar com o professor",
-    "falar com voce",
-    "falar com você",
-    "falar contigo",
     "humano",
     "atendente",
     "suporte humano",
     "quero o matheus",
-    "quero falar direto",
-    "quero falar com o matheus",
     "me chama ai",
     "me chama aí",
   ];
@@ -418,24 +401,22 @@ function isCalcIntent(text) {
     "quantos g",
     "quanto de resina",
     "quantidade de resina",
-    "resina precisa",
-    "quanto preciso de resina",
     "quanto endurecedor",
     "mistura",
     "proporcao",
     "proporção",
     "litros",
     "ml",
+    "kg",
+    "grama",
+    "gramas",
   ];
-
-  const hasDimsInline = /(\d+([.,]\d+)?x){2}\d+([.,]\d+)?(mm|cm|m)\b/i.test(text); // ✅ exige unidade
-  if (hasDimsInline) return true;
 
   return keywords.some((k) => s.includes(normalizeLoose(k)));
 }
 
 /* =========================
-   CALCULADORA
+   CALCULADORA (core)
    ========================= */
 const DENSITY_KG_PER_L = 1.10;
 const PI = Math.PI;
@@ -447,10 +428,13 @@ function isBareNumber(input) {
 
 function parseUnitOnly(input) {
   const s = normalizeLoose(input);
+
+  // length
   if (s === "mm" || s === "milimetro" || s === "milimetros") return "mm";
   if (s === "cm" || s === "centimetro" || s === "centimetros") return "cm";
   if (s === "m" || s === "metro" || s === "metros") return "m";
 
+  // weight
   if (s === "g" || s === "grama" || s === "gramas") return "g";
   if (s === "kg" || s === "quilo" || s === "quilos" || s === "kilograma" || s === "kilogramas") return "kg";
 
@@ -461,10 +445,12 @@ function applyUnitToBareNumber(numStr, unit) {
   const val = Number((numStr || "").toString().replace(",", "."));
   if (!Number.isFinite(val) || val <= 0) return null;
 
+  // length -> cm
   if (unit === "m") return val * 100;
   if (unit === "mm") return val / 10;
   if (unit === "cm") return val;
 
+  // weight -> g
   if (unit === "kg") return val * 1000;
   if (unit === "g") return val;
 
@@ -473,7 +459,7 @@ function applyUnitToBareNumber(numStr, unit) {
 
 function parseLengthToCm(input) {
   const t = (input || "").toString().trim().toLowerCase().replace(",", ".");
-  const m = t.match(/^(\d+(\.\d+)?)(mm|cm|m)$/); // ✅ exige unidade
+  const m = t.match(/^(\d+(\.\d+)?)(mm|cm|m)$/);
   if (!m) return null;
 
   const val = Number(m[1]);
@@ -482,12 +468,12 @@ function parseLengthToCm(input) {
   const unit = m[3];
   if (unit === "m") return val * 100;
   if (unit === "mm") return val / 10;
-  return val; // cm
+  return val;
 }
 
 function parseWeightToG(input) {
   const t = (input || "").toString().trim().toLowerCase().replace(",", ".");
-  const m = t.match(/^(\d+(\.\d+)?)(kg|g)$/); // ✅ exige unidade
+  const m = t.match(/^(\d+(\.\d+)?)(kg|g)$/);
   if (!m) return null;
 
   const val = Number(m[1]);
@@ -495,44 +481,6 @@ function parseWeightToG(input) {
 
   const unit = m[3];
   return unit === "kg" ? val * 1000 : val;
-}
-
-function parseKitWeights(text) {
-  const t = (text || "").toString().trim().toLowerCase().replace(",", ".");
-  const matches = [...t.matchAll(/(\d+(\.\d+)?)(kg|g)\b/g)];
-  if (matches.length >= 2) {
-    const resinG = parseWeightToG(matches[0][0]);
-    const hardG = parseWeightToG(matches[1][0]);
-    if (resinG && hardG) return { resinG, hardG };
-  }
-  return null;
-}
-
-function parseDims3Inline(text) {
-  const raw = (text || "").toString().trim().toLowerCase().replace(/\s+/g, "");
-  const t = raw.replace(",", ".");
-
-  const unitMatch = t.match(/(mm|cm|m)$/);
-  if (!unitMatch) return null; // ✅ exige unidade
-  const unit = unitMatch[1];
-
-  const core = t.slice(0, -unit.length);
-  const parts = core.split("x").filter(Boolean);
-  if (parts.length !== 3) return null;
-
-  const nums = parts.map((p) => {
-    const n = Number(p);
-    return Number.isFinite(n) ? n : null;
-  });
-  if (nums.some((n) => n == null || n <= 0)) return null;
-
-  const toCm = (val) => {
-    if (unit === "m") return val * 100;
-    if (unit === "mm") return val / 10;
-    return val;
-  };
-
-  return { c_cm: toCm(nums[0]), l_cm: toCm(nums[1]), a_cm: toCm(nums[2]) };
 }
 
 function litersFromCm3(cm3) {
@@ -560,10 +508,6 @@ function computeVolumeLiters(calc) {
     const cm3 = PI * r * r * calc.a_cm;
     return litersFromCm3(cm3);
   }
-  if (shape === "triangular") {
-    const cm3 = (calc.base_cm * calc.alttri_cm / 2) * calc.comp_cm;
-    return litersFromCm3(cm3);
-  }
   if (shape === "camada") {
     const cm3 = calc.c_cm * calc.l_cm * calc.esp_cm;
     return litersFromCm3(cm3);
@@ -587,38 +531,29 @@ Escolha o formato:
 function calcNextPrompt(calc) {
   if (!calc.shape) return buildCalcMenu();
 
-  // ✅ Retângulo (sequencial)
   if (calc.shape === "retangulo") {
     if (calc.c_cm == null) return "Qual o comprimento? (mande o valor e a medida, ex: 30cm)";
-    if (calc.l_cm == null) return "Qual a largura? (ex: 10cm)";
-    if (calc.a_cm == null) return "Qual a espessura/altura? (ex: 0,5cm ou 5mm)";
-  }
-
-  // ✅ Canaleta (sequencial)
-  if (calc.shape === "canaleta") {
-    if (calc.c_cm == null) return "Qual o comprimento da canaleta? (ex: 30cm)";
-    if (calc.l_cm == null) return "Qual a largura da canaleta? (ex: 2cm)";
-    if (calc.a_cm == null) return "Qual a profundidade da canaleta? (ex: 1cm)";
+    if (calc.l_cm == null) return "Qual a largura? (mande o valor e a medida, ex: 10cm)";
+    if (calc.a_cm == null) return "Qual a espessura/altura? (mande o valor e a medida, ex: 0,5cm)";
   }
 
   if (calc.shape === "cilindro") {
-    if (calc.diam_cm == null) return "Qual o diâmetro? (ex: 10cm)";
-    if (calc.a_cm == null) return "Qual a altura/profundidade? (ex: 3cm)";
+    if (calc.diam_cm == null) return "Qual o diâmetro? (mande o valor e a medida, ex: 80cm)";
+    if (calc.a_cm == null) return "Qual a altura/profundidade? (mande o valor e a medida, ex: 4cm)";
   }
 
-  if (calc.shape === "triangular") {
-    if (calc.base_cm == null) return "Qual a base do triângulo? (ex: 12cm)";
-    if (calc.alttri_cm == null) return "Qual a altura do triângulo? (ex: 8cm)";
-    if (calc.comp_cm == null) return "Qual o comprimento do prisma? (ex: 40cm)";
+  if (calc.shape === "canaleta") {
+    if (calc.c_cm == null) return "Qual o comprimento da canaleta? (mande o valor e a medida, ex: 60cm)";
+    if (calc.l_cm == null) return "Qual a largura da canaleta? (mande o valor e a medida, ex: 2cm)";
+    if (calc.a_cm == null) return "Qual a profundidade da canaleta? (mande o valor e a medida, ex: 1cm)";
   }
 
   if (calc.shape === "camada") {
-    if (calc.c_cm == null) return "Qual o comprimento da área? (ex: 1m ou 30cm)";
-    if (calc.l_cm == null) return "Qual a largura da área? (ex: 0,5m ou 20cm)";
-    if (calc.esp_cm == null) return "Qual a espessura? (ex: 1mm ou 0,2cm)";
+    if (calc.c_cm == null) return "Qual o comprimento da área? (mande o valor e a medida, ex: 1m)";
+    if (calc.l_cm == null) return "Qual a largura da área? (mande o valor e a medida, ex: 40cm)";
+    if (calc.esp_cm == null) return "Qual a espessura da camada? (mande o valor e a medida, ex: 2mm)";
   }
 
-  // ✅ KIT separado (A depois B)
   calc.kit ??= { resinG: null, hardG: null };
   if (calc.kit.resinG == null) return "Quanto veio de *Resina (Componente A)*? (ex: 1kg ou 500g)";
   if (calc.kit.hardG == null) return "E quanto veio de *Endurecedor (Componente B)*? (ex: 120g ou 0,12kg)";
@@ -644,13 +579,11 @@ function finishCalcMessage(calc) {
 
 🧪 Mistura (baseado no seu KIT):
 - *Resina*: ${formatG(resin_g)}
-- *Endurecedor*: ${formatG(hard_g)}
-
-Quer calcular outra peça? É só me dizer "quero calcular" 🙂`;
+- *Endurecedor*: ${formatG(hard_g)}`;
 }
 
 /* =========================
-   MODO “PLANO”
+   Plano em partes
    ========================= */
 function isContinueText(t) {
   const s = normalizeLoose(t);
@@ -677,16 +610,12 @@ function looksLikePlanRequest(t) {
 
 /* =========================
    WhatsApp Media: meta + download
-   (serve pra áudio e imagem)
    ========================= */
 async function getWhatsAppMediaMeta(mediaId, trace) {
   const url = `https://graph.facebook.com/v22.0/${mediaId}`;
   const r = await fetchWithTimeout(
     url,
-    {
-      method: "GET",
-      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` },
-    },
+    { method: "GET", headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } },
     12000
   );
 
@@ -695,16 +624,13 @@ async function getWhatsAppMediaMeta(mediaId, trace) {
     console.log("❌ Media meta error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
     return null;
   }
-  return data; // { url, mime_type, file_size, ... }
+  return data;
 }
 
 async function downloadWhatsAppMediaFile(mediaUrl, trace) {
   const r = await fetchWithTimeout(
     mediaUrl,
-    {
-      method: "GET",
-      headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` },
-    },
+    { method: "GET", headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` } },
     20000
   );
 
@@ -733,11 +659,7 @@ async function transcribeWithOpenAI({ arrayBuffer, contentType, trace }) {
 
   const r = await fetchWithTimeout(
     "https://api.openai.com/v1/audio/transcriptions",
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: form,
-    },
+    { method: "POST", headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, body: form },
     25000
   );
 
@@ -746,7 +668,6 @@ async function transcribeWithOpenAI({ arrayBuffer, contentType, trace }) {
     console.log("❌ OpenAI transcription error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
     return null;
   }
-
   const text = (data?.text || "").trim();
   return text || null;
 }
@@ -781,16 +702,12 @@ async function analyzeImageWithOpenAI({ imageArrayBuffer, mimeType, userRequest,
 
   const system = `
 Você é o ${SEVERINO_NAME}, o assistente "faz-tudo" da Universidade da Resina (Prof. Matheus).
-
-Você VAI ANALISAR UMA IMAGEM enviada por um aluno (peça com resina/ madeira / molde / acabamento).
 Regras:
 - NÃO invente detalhes que não dá pra ver.
-- Se algo estiver incerto, diga o que você precisa confirmar.
 - Foque em: bolhas, cura/pegajosidade, marcas de lixamento, contaminação/poeira, selagem, nivelamento, vazamento/moldes.
-- Entregue: (1) diagnóstico provável, (2) causa provável, (3) o que fazer agora, (4) prevenção no próximo projeto.
-- Tom WhatsApp: direto, prático, sem enrolar (0–2 emojis).
+- Entregue: (1) diagnóstico provável, (2) causa provável, (3) o que fazer agora, (4) prevenção.
+- Tom WhatsApp: direto, sem enrolar (0–2 emojis).
 - Termine com 1 pergunta objetiva.
-
 Aluno: ${studentName || "desconhecido"} | Tratamento: ${addr}
 Horário (SP): ${spTime}
 `.trim();
@@ -798,7 +715,10 @@ Horário (SP): ${spTime}
   const b64 = arrayBufferToBase64(imageArrayBuffer);
   const dataUrl = `data:${mimeType};base64,${b64}`;
 
-  const contextText = [caption ? `Legenda da foto (caption): ${caption}` : null, userRequest ? `Pedido do aluno: ${userRequest}` : null]
+  const contextText = [
+    caption ? `Legenda da foto (caption): ${caption}` : null,
+    userRequest ? `Pedido do aluno: ${userRequest}` : null,
+  ]
     .filter(Boolean)
     .join("\n");
 
@@ -822,10 +742,7 @@ Horário (SP): ${spTime}
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
     25000
@@ -837,69 +754,40 @@ Horário (SP): ${spTime}
     return "Deu um erro na hora de analisar a imagem 😅 Pode mandar a foto de novo (mais perto/mais luz) e me dizer o que você quer que eu avalie nela?";
   }
 
-  return (
-    data?.choices?.[0]?.message?.content?.trim() ||
-    "Recebi a imagem. Me diz em 1 frase o que você quer que eu avalie nela (bolhas, cura, acabamento, molde, etc.)."
-  );
+  return data?.choices?.[0]?.message?.content?.trim() ||
+    "Recebi a imagem. Me diz em 1 frase o que você quer que eu avalie nela (bolhas, cura, acabamento, molde, etc.).";
 }
-
 /* =========================
    AGENTE SEVERINO 🤖 (texto)
    ========================= */
 async function getAIReply({ history, userText, trace, profile }) {
   const spTime = nowInSaoPaulo();
-
   const name = profile?.name || null;
   const gender = profile?.gender || null;
   const addr = friendlyAddress(profile);
-
   const useName = name && shouldUseNameSometimes() ? ` (${name})` : "";
 
   const system = `
 Você é o ${SEVERINO_NAME}, o assistente "faz-tudo" da Universidade da Resina (Prof. Matheus).
 
-MISSÃO
-Você é dedicado e se preocupa com o entendimento e bem-estar do aluno. Você explica com calma, confirma entendimento e evita que o aluno erre ou desperdice material.
-
 TOM
 - WhatsApp: curto por padrão; aprofunda se pedirem.
-- Pode usar "${addr}" às vezes (não toda hora).
-- Emojis com intenção (0–2 por mensagem).
-- Ao falar de si mesmo, use "Severino 🤖".
+- Use "${addr}" às vezes (não toda hora).
+- Emojis com intenção (0–2).
+- Ao falar de si, use "Severino 🤖".
 
 ALUNO
-- Nome do aluno: ${name || "desconhecido"}
-- Gênero (inferido com cuidado): ${gender || "desconhecido"}
-- Tratamento sugerido: ${addr}
+- Nome: ${name || "desconhecido"}
+- Gênero: ${gender || "desconhecido"}
 - Você pode usar o nome no máximo 1 vez nessa resposta${useName}.
 
-PRINCÍPIOS
-- Madeira é viva (umidade/temperatura). Resina é química (proporção/mistura/espessura/ambiente).
-- Pressa é inimiga da resina.
-- Teste antes da peça final.
-- Ambiente controlado = previsibilidade.
-- 90% do acabamento nasce antes do lixamento.
-
-BASE TÉCNICA (resumo)
-- Resina baixa: selagem/camadas finas; não usar em grandes volumes.
-- Média: versátil (tábuas/bandejas/peças médias).
-- Alta: vazamentos altos (mesas); respeitar altura máxima por camada e tempo entre camadas.
-- Madeira ideal 8–12% umidade; madeira úmida causa bolhas/trincas/descolamento.
-- Selagem reduz bolhas e economiza resina.
-- Ambiente ideal 20–25°C; evitar vento/poeira/sol direto; base nivelada.
-- Mistura em peso, devagar 3–5min raspando laterais/fundo; trocar de recipiente ajuda.
-- Pigmento: pouco; excesso pode prejudicar cura.
-- Bolhas: selagem + soprador rápido nos primeiros minutos; bolha interna não corrige depois.
-- Lixamento comum: 80/120 -> 220/320 -> 400/600 -> 800 a 2000; polimento depois.
-- Segurança: luvas, máscara, óculos, ventilação, longe de alimentos/crianças.
-
-REGRA IMPORTANTE SOBRE CÁLCULOS
+REGRA SOBRE CÁLCULOS
 - Se o usuário pedir cálculo, NÃO faça conta manual no texto.
 - Ofereça a calculadora e peça confirmação (1 sim / 2 não).
 
 PLANOS LONGOS
 Quando pedir plano/guia/checklist:
-1) resumo curto (7–10 linhas)
+1) resumo curto
 2) "Quer que eu continue em partes? (sim/continuar)"
 
 REGRAS
@@ -919,10 +807,7 @@ Horário (SP): ${spTime}
     "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
     15000
@@ -931,12 +816,12 @@ Horário (SP): ${spTime}
   const data = await r.json().catch(() => ({}));
   if (!r.ok) {
     console.log("❌ OpenAI error:", { trace, status: r.status, data: JSON.stringify(data).slice(0, 900) });
-    return `Entendi, ${addr}. Quer usar a Calculadora exclusiva pra eu calcular certinho? (1) Sim (2) Não`;
+    return `Entendi, ${addr}. Quer usar a *Calculadora de Resina* agora?\n\n1) Sim, quero calcular\n2) Não, só uma orientação`;
   }
 
   return (
     data?.choices?.[0]?.message?.content?.trim() ||
-    `Entendi, ${addr}. Quer usar a Calculadora exclusiva pra eu calcular certinho? (1) Sim (2) Não`
+    `Entendi, ${addr}. Quer usar a *Calculadora de Resina* agora?\n\n1) Sim, quero calcular\n2) Não, só uma orientação`
   );
 }
 
@@ -970,21 +855,18 @@ export default async function handler(req, res) {
     const msgId = msg.id;
     const trace = `${from}:${msgId || "noid"}`;
 
-    // Dedup global (Redis)
+    // Dedup
     if (await isDuplicateMsg(msgId)) return res.status(200).json({ ok: true });
 
     if (msg.type === "sticker") return res.status(200).json({ ok: true });
 
-    // sessão persistente
     const sess = await ensureSession(from);
 
     /* =========================
-       Severino: handoff / voltar pro bot
+       Handoff gating
        ========================= */
     const now = Date.now();
 
-    // Se bot tá em handoff e a pessoa manda qualquer coisa: não competir
-    // MAS: deixa passar comandos úteis (#bot, #reset, #calc e intenção de cálculo)
     if (sess.state.humanHandoffUntil && sess.state.humanHandoffUntil > now) {
       if (msg.type === "text") {
         const t = msg.text?.body?.trim() || "";
@@ -994,7 +876,6 @@ export default async function handler(req, res) {
         if (allow) {
           sess.state.humanHandoffUntil = 0;
           await kvSetSession(from, sess);
-          // segue o fluxo normal (não dá return)
         } else {
           return res.status(200).json({ ok: true });
         }
@@ -1004,7 +885,7 @@ export default async function handler(req, res) {
     }
 
     /* =========================
-       1) Se chegou IMAGEM: pedir confirmação (opção 2)
+       1) IMAGEM
        ========================= */
     if (msg.type === "image") {
       const mediaId = msg.image?.id;
@@ -1036,7 +917,7 @@ Exemplos:
     }
 
     /* =========================
-       2) Captura texto (ou transcreve áudio)
+       2) TEXTO (ou ÁUDIO)
        ========================= */
     let userText = "";
 
@@ -1075,7 +956,7 @@ Exemplos:
     }
 
     /* =========================
-       Severino: handoff (pedido humano)
+       Handoff humano (pedido)
        ========================= */
     if (wantsHuman(userText)) {
       const addr = friendlyAddress(sess.profile);
@@ -1094,7 +975,6 @@ Quando quiser voltar pro ${SEVERINO_NAME} depois, é só mandar: #bot`;
       return res.status(200).json({ ok: true });
     }
 
-    // voltar pro bot
     if (wantsBotBack(userText)) {
       sess.state.humanHandoffUntil = 0;
       const back = `Fechado 🙂 Aqui é o ${SEVERINO_NAME}. Me diz o que você precisa agora.`;
@@ -1104,11 +984,10 @@ Quando quiser voltar pro ${SEVERINO_NAME} depois, é só mandar: #bot`;
       return res.status(200).json({ ok: true });
     }
 
-    // dica explícita de gênero
     const gHint = genderHintFromText(userText);
     if (gHint) sess.profile.gender = gHint;
 
-    // capturar nome (sem travar o fluxo)
+    // capturar nome
     if (!sess.profile.name) {
       const maybe = extractName(userText);
       if (maybe) {
@@ -1127,13 +1006,13 @@ Me diz, ${addr}: você quer tirar uma dúvida, mandar foto/áudio, ou quer calcu
         return res.status(200).json({ ok: true });
       }
 
-      // só pede o nome uma vez por sessão (pra não encher)
       if (!sess.profile.askedName) {
         sess.profile.askedName = true;
         const intro = `Olá! Eu sou o ${SEVERINO_NAME}, assistente da Universidade da Resina.  
 Tô aqui pra te ajudar no que precisar — dúvidas, cálculos, áudios e fotos.
 
 Como posso te chamar? 🙂`;
+
         await sleep(humanDelayMs(intro));
         await sendWhatsAppText({ to: from, bodyText: intro, trace });
 
@@ -1143,7 +1022,7 @@ Como posso te chamar? 🙂`;
     }
 
     /* =========================
-       Escape UNIVERSAL: #reset (zera tudo)
+       #reset
        ========================= */
     if (normalizeLoose(userText) === "#reset") {
       await kvDelSession(from);
@@ -1154,7 +1033,47 @@ Como posso te chamar? 🙂`;
     }
 
     /* =========================
-       Escape da CALCULADORA (sem resetar sessão)
+       ✅ Pós-cálculo (menu 1/2)
+       ========================= */
+    if (sess.state.pendingAfterCalc) {
+      const s = normalizeLoose(userText);
+
+      const wantsAgain = ["1", "sim", "s", "quero", "bora", "vamos", "ok", "beleza"].includes(s);
+      const wantsMentor = ["2", "nao", "não", "n", "depois"].includes(s);
+
+      if (wantsAgain) {
+        sess.state.pendingAfterCalc = false;
+        sess.state.mode = "calc";
+        sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
+
+        const prompt = calcNextPrompt(sess.state.calc);
+        await sleep(humanDelayMs(prompt));
+        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
+      }
+
+      if (wantsMentor) {
+        sess.state.pendingAfterCalc = false;
+        const ok = "Fechado 🙂 Voltamos pro mentor. Me manda sua dúvida.";
+        await sleep(humanDelayMs(ok));
+        await sendWhatsAppText({ to: from, bodyText: ok, trace });
+
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
+      }
+
+      const again = "Só pra eu entender: quer calcular outra peça? Responde 1 (sim) ou 2 (não).";
+      await sleep(humanDelayMs(again));
+      await sendWhatsAppText({ to: from, bodyText: again, trace });
+
+      await kvSetSession(from, sess);
+      return res.status(200).json({ ok: true });
+    }
+
+    /* =========================
+       Escape calc (sair/menu)
        ========================= */
     if (sess.state.mode === "calc" || sess.state.pendingCalcConfirm) {
       if (isEscapeCalc(userText)) {
@@ -1173,7 +1092,7 @@ Como posso te chamar? 🙂`;
     }
 
     /* =========================
-       3) Se tem IMAGEM pendente e agora chegou o “pedido livre” -> analisar
+       IMAGEM pendente -> analisar
        ========================= */
     if (sess.state.pendingImage?.mediaId) {
       if (isCancel(userText)) {
@@ -1252,15 +1171,11 @@ Como posso te chamar? 🙂`;
     }
 
     /* =========================
-       debug calc
+       debug calc (#calc)
        ========================= */
     if (normalizeLoose(userText) === "#calc") {
       sess.state.mode = "calc";
-      sess.state.calc = {
-        shape: null,
-        kit: { resinG: null, hardG: null },
-        pendingUnit: null, // { kind:"len"|"weight", key:"c_cm|l_cm|a_cm|...", raw:"30" }
-      };
+      sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
       sess.state.pendingCalcConfirm = false;
 
       const prompt = calcNextPrompt(sess.state.calc);
@@ -1297,26 +1212,6 @@ Como posso te chamar? 🙂`;
        Oferta da calculadora
        ========================= */
     if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
-      // ✅ Se já veio medidas 3D "30x10x0,5cm", entra direto no modo calc (retângulo)
-      const inlineDims = parseDims3Inline(userText);
-      if (inlineDims) {
-        sess.state.mode = "calc";
-        sess.state.calc = {
-          shape: "retangulo",
-          kit: { resinG: null, hardG: null },
-          pendingUnit: null,
-          ...inlineDims,
-        };
-        sess.state.pendingCalcConfirm = false;
-
-        const prompt = calcNextPrompt(sess.state.calc);
-        await sleep(humanDelayMs(prompt));
-        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
-
       sess.state.pendingCalcConfirm = true;
 
       const offer = `🧮 Quer usar a *Calculadora de Resina* agora?
@@ -1336,11 +1231,7 @@ Como posso te chamar? 🙂`;
       if (isYes(userText)) {
         sess.state.pendingCalcConfirm = false;
         sess.state.mode = "calc";
-        sess.state.calc = {
-          shape: null,
-          kit: { resinG: null, hardG: null },
-          pendingUnit: null,
-        };
+        sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
 
         const prompt = calcNextPrompt(sess.state.calc);
         await sleep(humanDelayMs(prompt));
@@ -1364,63 +1255,63 @@ Como posso te chamar? 🙂`;
     }
 
     /* =========================
-       MODO CALC
+       MODO CALC (100% estável)
        ========================= */
     if (sess.state.mode === "calc" && sess.state.calc) {
       const calc = sess.state.calc;
-
       calc.kit ??= { resinG: null, hardG: null };
       calc.pendingUnit ??= null;
 
-      // ✅ escape dentro do modo calc (extra segurança)
-      if (isEscapeCalc(userText)) {
-        sess.state.mode = "mentor";
-        sess.state.calc = null;
-        sess.state.pendingCalcConfirm = false;
-
-        const ok = "Fechado 🙂 Saímos da calculadora e voltamos pro mentor. Me diz qual é a tua dúvida agora.";
-        await sleep(humanDelayMs(ok));
-        await sendWhatsAppText({ to: from, bodyText: ok, trace });
-
+      // ✅ helper: pergunta unidade e ENCERRA request
+      const askUnit = async (kind, key, raw) => {
+        calc.pendingUnit = { kind, key, raw };
+        const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
+        await sleep(humanDelayMs(ask));
+        await sendWhatsAppText({ to: from, bodyText: ask, trace });
         await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
-      }
+      };
 
-      // ✅ Se estamos aguardando unidade (mm/cm/m ou g/kg)
+      // ✅ FIX GLOBAL: se chegou unidade, aplica e ENCERRA (não pula etapa)
       if (calc.pendingUnit) {
+        const prev = calc.pendingUnit;
         const u = parseUnitOnly(userText);
 
-        const isLen = calc.pendingUnit.kind === "len";
-        const isWeight = calc.pendingUnit.kind === "weight";
+        const isLen = prev.kind === "len";
+        const isWeight = prev.kind === "weight";
 
-        // valida unidade esperada
         const okUnit =
           (isLen && (u === "mm" || u === "cm" || u === "m")) ||
           (isWeight && (u === "g" || u === "kg"));
 
         if (!okUnit) {
-          const again = isLen ? "Qual unidade você quis dizer? Responde só: mm, cm ou m" : "Qual unidade você quis dizer? Responde só: g ou kg";
+          const again = isLen ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
           await sleep(humanDelayMs(again));
           await sendWhatsAppText({ to: from, bodyText: again, trace });
           await kvSetSession(from, sess);
           return res.status(200).json({ ok: true });
         }
 
-        const applied = applyUnitToBareNumber(calc.pendingUnit.raw, u);
-        if (applied == null) {
-          calc.pendingUnit = null;
-        } else {
-          if (isLen) {
-            calc[calc.pendingUnit.key] = applied; // cm
-          } else {
-            // weight -> g
-            if (calc.pendingUnit.key === "resinG") calc.kit.resinG = applied;
-            if (calc.pendingUnit.key === "hardG") calc.kit.hardG = applied;
+        const applied = applyUnitToBareNumber(prev.raw, u);
+        if (applied != null) {
+          if (isLen) calc[prev.key] = applied; // cm
+          else {
+            if (prev.key === "resinG") calc.kit.resinG = applied; // g
+            if (prev.key === "hardG") calc.kit.hardG = applied; // g
           }
-          calc.pendingUnit = null;
         }
+
+        calc.pendingUnit = null;
+
+        const next = calcNextPrompt(calc);
+        await sleep(humanDelayMs(next));
+        await sendWhatsAppText({ to: from, bodyText: next, trace });
+
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
       }
 
+      // shape selection
       if (!calc.shape) {
         const n = userText.trim();
         if (n === "1") calc.shape = "retangulo";
@@ -1431,7 +1322,6 @@ Como posso te chamar? 🙂`;
           const again = buildCalcMenu();
           await sleep(humanDelayMs(again));
           await sendWhatsAppText({ to: from, bodyText: again, trace });
-
           await kvSetSession(from, sess);
           return res.status(200).json({ ok: true });
         }
@@ -1439,202 +1329,125 @@ Como posso te chamar? 🙂`;
         const prompt = calcNextPrompt(calc);
         await sleep(humanDelayMs(prompt));
         await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-
         await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
       }
 
-      const askUnitIfBare = async (kind, key) => {
-        calc.pendingUnit = { kind, key, raw: userText.trim().replace(",", ".") };
-        const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
-        await sleep(humanDelayMs(ask));
-        await sendWhatsAppText({ to: from, bodyText: ask, trace });
-      };
-
-      const setLenOrWarn = async (key, msg, prompt) => {
-        // se veio só número, perguntar unidade
+      // helper: set length (supports bare number -> ask unit)
+      const setLenOrAsk = async (key, labelMsg) => {
         if (isBareNumber(userText)) {
-          await askUnitIfBare("len", key);
-          return false;
+          return await askUnit("len", key, userText.trim().replace(",", "."));
         }
-
-        // se veio no formato 30x10x0,5cm durante retângulo/canaleta, aceitamos e preenchemos logo
-        const inline = parseDims3Inline(userText);
-        if (inline && (calc.shape === "retangulo" || calc.shape === "canaleta")) {
-          calc.c_cm = inline.c_cm;
-          calc.l_cm = inline.l_cm;
-          calc.a_cm = inline.a_cm;
-          return true;
-        }
-
         const v = parseLengthToCm(userText);
-        if (v == null || v <= 0) {
-          await sendCalcInvalid({ to: from, trace, msg, prompt });
-          return false;
+        if (v == null) {
+          await sendCalcInvalid({ to: from, trace, msg: `Não consegui entender ${labelMsg} 😅`, prompt: "Manda com unidade: ex 30cm, 1m, 5mm" });
+          await kvSetSession(from, sess);
+          return res.status(200).json({ ok: true });
         }
         calc[key] = v;
-        return true;
+        return null;
       };
 
-      // ======== MEDIDAS (sequencial por shape) ========
+      // helper: set weight A/B (supports bare number -> ask unit)
+      const setWeightOrAsk = async (key, prettyName) => {
+        if (isBareNumber(userText)) {
+          return await askUnit("weight", key, userText.trim().replace(",", "."));
+        }
+        const g = parseWeightToG(userText);
+        if (g == null) {
+          await sendCalcInvalid({ to: from, trace, msg: `Não consegui entender o ${prettyName} 😅`, prompt: "Manda com unidade: ex 1kg ou 500g" });
+          await kvSetSession(from, sess);
+          return res.status(200).json({ ok: true });
+        }
+        if (key === "resinG") calc.kit.resinG = g;
+        if (key === "hardG") calc.kit.hardG = g;
+        return null;
+      };
 
+      // medidas por shape
       if (calc.shape === "retangulo") {
         if (calc.c_cm == null) {
-          const ok = await setLenOrWarn("c_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento? (ex: 30cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("c_cm", "o comprimento");
+          if (r) return r;
         } else if (calc.l_cm == null) {
-          const ok = await setLenOrWarn("l_cm", "Não consegui entender a largura 😅", "Qual a largura? (ex: 10cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("l_cm", "a largura");
+          if (r) return r;
         } else if (calc.a_cm == null) {
-          const ok = await setLenOrWarn("a_cm", "Não consegui entender a espessura/altura 😅", "Qual a espessura/altura? (ex: 0,5cm ou 5mm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
-        }
-      }
-
-      if (calc.shape === "canaleta") {
-        if (calc.c_cm == null) {
-          const ok = await setLenOrWarn("c_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento da canaleta? (ex: 30cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
-        } else if (calc.l_cm == null) {
-          const ok = await setLenOrWarn("l_cm", "Não consegui entender a largura 😅", "Qual a largura da canaleta? (ex: 2cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
-        } else if (calc.a_cm == null) {
-          const ok = await setLenOrWarn("a_cm", "Não consegui entender a profundidade 😅", "Qual a profundidade da canaleta? (ex: 1cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("a_cm", "a espessura/altura");
+          if (r) return r;
         }
       }
 
       if (calc.shape === "cilindro") {
         if (calc.diam_cm == null) {
-          const ok = await setLenOrWarn("diam_cm", "Não consegui entender o diâmetro 😅", "Qual o diâmetro? (ex: 10cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("diam_cm", "o diâmetro");
+          if (r) return r;
         } else if (calc.a_cm == null) {
-          const ok = await setLenOrWarn("a_cm", "Não consegui entender a altura 😅", "Qual a altura/profundidade? (ex: 3cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("a_cm", "a altura/profundidade");
+          if (r) return r;
         }
       }
 
-      if (calc.shape === "triangular") {
-        if (calc.base_cm == null) {
-          const ok = await setLenOrWarn("base_cm", "Não consegui entender a base 😅", "Qual a base do triângulo? (ex: 12cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
-        } else if (calc.alttri_cm == null) {
-          const ok = await setLenOrWarn("alttri_cm", "Não consegui entender a altura 😅", "Qual a altura do triângulo? (ex: 8cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
-        } else if (calc.comp_cm == null) {
-          const ok = await setLenOrWarn("comp_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento do prisma? (ex: 40cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+      if (calc.shape === "canaleta") {
+        if (calc.c_cm == null) {
+          const r = await setLenOrAsk("c_cm", "o comprimento");
+          if (r) return r;
+        } else if (calc.l_cm == null) {
+          const r = await setLenOrAsk("l_cm", "a largura");
+          if (r) return r;
+        } else if (calc.a_cm == null) {
+          const r = await setLenOrAsk("a_cm", "a profundidade");
+          if (r) return r;
         }
       }
 
       if (calc.shape === "camada") {
         if (calc.c_cm == null) {
-          const ok = await setLenOrWarn("c_cm", "Não consegui entender o comprimento 😅", "Qual o comprimento da área? (ex: 1m ou 30cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("c_cm", "o comprimento");
+          if (r) return r;
         } else if (calc.l_cm == null) {
-          const ok = await setLenOrWarn("l_cm", "Não consegui entender a largura 😅", "Qual a largura da área? (ex: 0,5m ou 20cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("l_cm", "a largura");
+          if (r) return r;
         } else if (calc.esp_cm == null) {
-          const ok = await setLenOrWarn("esp_cm", "Não consegui entender a espessura 😅", "Qual a espessura? (ex: 1mm ou 0,2cm)");
-          if (!ok) {
-            await kvSetSession(from, sess);
-            return res.status(200).json({ ok: true });
-          }
+          const r = await setLenOrAsk("esp_cm", "a espessura");
+          if (r) return r;
         }
       }
 
+      // checar se medidas completas
       const measuresComplete =
         (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
-        (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
         (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
-        (calc.shape === "triangular" && calc.base_cm != null && calc.alttri_cm != null && calc.comp_cm != null) ||
+        (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
         (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
-      // ======== KIT separado (A depois B) ========
-      if (measuresComplete) {
-        // se aluno mandar "1kg e 120g" numa tacada, aceitamos
-        const both = parseKitWeights(userText);
-        if (both) {
-          calc.kit.resinG = both.resinG;
-          calc.kit.hardG = both.hardG;
-        } else {
-          // A
-          if (calc.kit.resinG == null) {
-            if (isBareNumber(userText)) {
-              await askUnitIfBare("weight", "resinG");
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
+      // kit A/B separado
+      if (measuresComplete && calc.kit.resinG == null) {
+        const r = await setWeightOrAsk("resinG", "Componente A (Resina)");
+        if (r) return r;
 
-            const g = parseWeightToG(userText);
-            if (!g) {
-              await sendCalcInvalid({ to: from, trace, msg: "Não entendi a quantidade de Resina (A) 😅", prompt: "Exemplo: 1kg ou 500g" });
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-            calc.kit.resinG = g;
-          }
-          // B
-          else if (calc.kit.hardG == null) {
-            if (isBareNumber(userText)) {
-              await askUnitIfBare("weight", "hardG");
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-
-            const g = parseWeightToG(userText);
-            if (!g) {
-              await sendCalcInvalid({ to: from, trace, msg: "Não entendi a quantidade de Endurecedor (B) 😅", prompt: "Exemplo: 120g ou 0,12kg" });
-              await kvSetSession(from, sess);
-              return res.status(200).json({ ok: true });
-            }
-            calc.kit.hardG = g;
-          }
-        }
+        const next = calcNextPrompt(calc);
+        await sleep(humanDelayMs(next));
+        await sendWhatsAppText({ to: from, bodyText: next, trace });
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
       }
 
-      // se já completou tudo
-      if (measuresComplete && calc.kit?.resinG != null && calc.kit?.hardG != null) {
+      if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG == null) {
+        const r = await setWeightOrAsk("hardG", "Componente B (Endurecedor)");
+        if (r) return r;
+
+        const next = calcNextPrompt(calc);
+        await sleep(humanDelayMs(next));
+        await sendWhatsAppText({ to: from, bodyText: next, trace });
+        await kvSetSession(from, sess);
+        return res.status(200).json({ ok: true });
+      }
+
+      // finalizar
+      if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG != null) {
         const done = finishCalcMessage(calc);
+
         sess.state.mode = "mentor";
         sess.state.calc = null;
 
@@ -1644,20 +1457,30 @@ Como posso te chamar? 🙂`;
           await sendWhatsAppText({ to: from, bodyText: part, trace });
         }
 
+        // ✅ menu pós-cálculo (resolve o "quero" bagunçando)
+        sess.state.pendingAfterCalc = true;
+        const ask = `Quer calcular outra peça?
+
+1) Sim (calcular outra)
+2) Não (voltar pro mentor)`;
+
+        await sleep(humanDelayMs(ask));
+        await sendWhatsAppText({ to: from, bodyText: ask, trace });
+
         await kvSetSession(from, sess);
         return res.status(200).json({ ok: true });
       }
 
+      // se ainda faltou algo, pergunta o próximo prompt
       const prompt = calcNextPrompt(calc);
       await sleep(humanDelayMs(prompt));
       await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-
       await kvSetSession(from, sess);
       return res.status(200).json({ ok: true });
     }
 
     /* =========================
-       MODO MENTOR (texto)
+       MODO MENTOR
        ========================= */
     const replyText = await getAIReply({ history: sess.history, userText, trace, profile: sess.profile });
 
