@@ -122,6 +122,14 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 12000) {
 }
 
 async function sendWhatsAppText({ to, bodyText, trace }) {
+  const txt = (bodyText || "").toString().trim();
+
+  // ✅ nunca tenta enviar vazio/null (evita “silêncio” por payload inválido)
+  if (!txt) {
+    console.log("⚠️ sendWhatsAppText skipped empty:", { trace });
+    return { ok: true, status: 200, dataText: "skipped-empty" };
+  }
+
   const url = `https://graph.facebook.com/v22.0/${process.env.PHONE_NUMBER_ID}/messages`;
 
   const r = await fetchWithTimeout(
@@ -136,7 +144,7 @@ async function sendWhatsAppText({ to, bodyText, trace }) {
         messaging_product: "whatsapp",
         to,
         type: "text",
-        text: { body: bodyText },
+        text: { body: txt },
       }),
     },
     12000
@@ -198,7 +206,7 @@ async function ensureSession(from) {
         pendingCalcConfirm: false,
         pendingImage: null,
         humanHandoffUntil: 0,
-        pendingAfterCalc: false, // ✅ NOVO: menu após cálculo
+        pendingAfterCalc: false, // ✅ menu após cálculo
       },
       _lastTs: Date.now(),
     };
@@ -754,9 +762,12 @@ Horário (SP): ${spTime}
     return "Deu um erro na hora de analisar a imagem 😅 Pode mandar a foto de novo (mais perto/mais luz) e me dizer o que você quer que eu avalie nela?";
   }
 
-  return data?.choices?.[0]?.message?.content?.trim() ||
-    "Recebi a imagem. Me diz em 1 frase o que você quer que eu avalie nela (bolhas, cura, acabamento, molde, etc.).";
+  return (
+    data?.choices?.[0]?.message?.content?.trim() ||
+    "Recebi a imagem. Me diz em 1 frase o que você quer que eu avalie nela (bolhas, cura, acabamento, molde, etc.)."
+  );
 }
+
 /* =========================
    AGENTE SEVERINO 🤖 (texto)
    ========================= */
@@ -824,7 +835,6 @@ Horário (SP): ${spTime}
     `Entendi, ${addr}. Quer usar a *Calculadora de Resina* agora?\n\n1) Sim, quero calcular\n2) Não, só uma orientação`
   );
 }
-
 /* =========================
    HANDLER
    ========================= */
@@ -848,60 +858,61 @@ export default async function handler(req, res) {
 
     if (value?.statuses?.length) return res.status(200).json({ ok: true });
 
-    const msg = value?.messages?.[0];
-    if (!msg) return res.status(200).json({ ok: true });
+    const msgs = Array.isArray(value?.messages) ? value.messages : [];
+    if (!msgs.length) return res.status(200).json({ ok: true });
 
-    const from = msg.from;
-    const msgId = msg.id;
-    const trace = `${from}:${msgId || "noid"}`;
+    // ✅ FIX #1: processa TODAS as mensagens do payload (não perde "G" etc.)
+    for (const msg of msgs) {
+      const from = msg.from;
+      const msgId = msg.id;
+      const trace = `${from}:${msgId || "noid"}`;
 
-    // Dedup
-    if (await isDuplicateMsg(msgId)) return res.status(200).json({ ok: true });
+      // Dedup
+      if (await isDuplicateMsg(msgId)) continue;
+      if (msg.type === "sticker") continue;
 
-    if (msg.type === "sticker") return res.status(200).json({ ok: true });
+      const sess = await ensureSession(from);
 
-    const sess = await ensureSession(from);
+      /* =========================
+         Handoff gating
+         ========================= */
+      const now = Date.now();
 
-    /* =========================
-       Handoff gating
-       ========================= */
-    const now = Date.now();
+      if (sess.state.humanHandoffUntil && sess.state.humanHandoffUntil > now) {
+        if (msg.type === "text") {
+          const t = msg.text?.body?.trim() || "";
+          const s = normalizeLoose(t);
+          const allow = wantsBotBack(t) || s === "#reset" || s === "#calc" || isCalcIntent(t);
 
-    if (sess.state.humanHandoffUntil && sess.state.humanHandoffUntil > now) {
-      if (msg.type === "text") {
-        const t = msg.text?.body?.trim() || "";
-        const s = normalizeLoose(t);
-        const allow = wantsBotBack(t) || s === "#reset" || s === "#calc" || isCalcIntent(t);
-
-        if (allow) {
-          sess.state.humanHandoffUntil = 0;
-          await kvSetSession(from, sess);
+          if (allow) {
+            sess.state.humanHandoffUntil = 0;
+            await kvSetSession(from, sess);
+          } else {
+            continue;
+          }
         } else {
-          return res.status(200).json({ ok: true });
+          continue;
         }
-      } else {
-        return res.status(200).json({ ok: true });
-      }
-    }
-
-    /* =========================
-       1) IMAGEM
-       ========================= */
-    if (msg.type === "image") {
-      const mediaId = msg.image?.id;
-      const caption = msg.image?.caption || "";
-
-      if (!mediaId) {
-        const quick = "Recebi uma imagem, mas não consegui puxar o arquivo 😅 Pode mandar de novo?";
-        await sleep(humanDelayMs(quick));
-        await sendWhatsAppText({ to: from, bodyText: quick, trace });
-        return res.status(200).json({ ok: true });
       }
 
-      sess.state.pendingImage = { mediaId, caption: caption || "", ts: Date.now() };
-      await kvSetSession(from, sess);
+      /* =========================
+         1) IMAGEM
+         ========================= */
+      if (msg.type === "image") {
+        const mediaId = msg.image?.id;
+        const caption = msg.image?.caption || "";
 
-      const ask = `📸 Foto recebida!
+        if (!mediaId) {
+          const quick = "Recebi uma imagem, mas não consegui puxar o arquivo 😅 Pode mandar de novo?";
+          await sleep(humanDelayMs(quick));
+          await sendWhatsAppText({ to: from, bodyText: quick, trace });
+          continue;
+        }
+
+        sess.state.pendingImage = { mediaId, caption: caption || "", ts: Date.now() };
+        await kvSetSession(from, sess);
+
+        const ask = `📸 Foto recebida!
 Me diz em uma frase o que você quer que eu avalie nela.
 
 Exemplos:
@@ -911,586 +922,597 @@ Exemplos:
 - “deu vazamento no molde”
 - “como melhorar o acabamento?”`;
 
-      await sleep(humanDelayMs(ask));
-      await sendWhatsAppText({ to: from, bodyText: ask, trace });
-      return res.status(200).json({ ok: true });
-    }
+        await sleep(humanDelayMs(ask));
+        await sendWhatsAppText({ to: from, bodyText: ask, trace });
+        continue;
+      }
 
-    /* =========================
-       2) TEXTO (ou ÁUDIO)
-       ========================= */
-    let userText = "";
+      /* =========================
+         2) TEXTO (ou ÁUDIO)
+         ========================= */
+      let userText = "";
 
-    if (msg.type === "text") {
-      userText = msg.text?.body?.trim() || "";
-      if (!userText) return res.status(200).json({ ok: true });
-    } else if (msg.type === "audio") {
-      const mediaId = msg.audio?.id;
-      if (!mediaId) {
-        const quick = "Não consegui acessar esse áudio 😅 Me manda em texto rapidinho?";
+      if (msg.type === "text") {
+        userText = msg.text?.body?.trim() || "";
+        if (!userText) continue;
+      } else if (msg.type === "audio") {
+        const mediaId = msg.audio?.id;
+        if (!mediaId) {
+          const quick = "Não consegui acessar esse áudio 😅 Me manda em texto rapidinho?";
+          await sleep(humanDelayMs(quick));
+          await sendWhatsAppText({ to: from, bodyText: quick, trace });
+          continue;
+        }
+
+        const ack = "Tô ouvindo teu áudio aqui… 🎧";
+        await sleep(humanDelayMs(ack));
+        await sendWhatsAppText({ to: from, bodyText: ack, trace });
+
+        const transcript = await transcribeWhatsAppAudio({ mediaId, trace });
+        if (!transcript) {
+          const fail = "Deu ruim pra transcrever esse áudio 😅 Pode mandar de novo (mais pertinho do microfone) ou escrever em texto?";
+          await sleep(humanDelayMs(fail));
+          await sendWhatsAppText({ to: from, bodyText: fail, trace });
+          continue;
+        }
+
+        userText = transcript.trim();
+        sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText.slice(0, 900)}` });
+        if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
+      } else {
+        const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou manda um áudio / foto).";
         await sleep(humanDelayMs(quick));
         await sendWhatsAppText({ to: from, bodyText: quick, trace });
-        return res.status(200).json({ ok: true });
+        continue;
       }
 
-      const ack = "Tô ouvindo teu áudio aqui… 🎧";
-      await sleep(humanDelayMs(ack));
-      await sendWhatsAppText({ to: from, bodyText: ack, trace });
-
-      const transcript = await transcribeWhatsAppAudio({ mediaId, trace });
-      if (!transcript) {
-        const fail = "Deu ruim pra transcrever esse áudio 😅 Pode mandar de novo (mais pertinho do microfone) ou escrever em texto?";
-        await sleep(humanDelayMs(fail));
-        await sendWhatsAppText({ to: from, bodyText: fail, trace });
-        return res.status(200).json({ ok: true });
-      }
-
-      userText = transcript.trim();
-      sess.history.push({ role: "user", content: `🗣️ (áudio) ${userText.slice(0, 900)}` });
-      if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
-    } else {
-      const quick = "Consigo te ajudar 🙂 Me manda em texto sua dúvida (ou manda um áudio / foto).";
-      await sleep(humanDelayMs(quick));
-      await sendWhatsAppText({ to: from, bodyText: quick, trace });
-      return res.status(200).json({ ok: true });
-    }
-
-    /* =========================
-       Handoff humano (pedido)
-       ========================= */
-    if (wantsHuman(userText)) {
-      const addr = friendlyAddress(sess.profile);
-      const msgHandoff = `Claro, ${addr} 🙂  
+      /* =========================
+         Handoff humano (pedido)
+         ========================= */
+      if (wantsHuman(userText)) {
+        const addr = friendlyAddress(sess.profile);
+        const msgHandoff = `Claro, ${addr} 🙂  
 Se quiser falar direto com o professor Matheus, é só tocar aqui:
 👉 ${PROFESSOR_MATHEUS_WA}
 
 Quando quiser voltar pro ${SEVERINO_NAME} depois, é só mandar: #bot`;
 
-      sess.state.humanHandoffUntil = Date.now() + HANDOFF_TTL_MS;
+        sess.state.humanHandoffUntil = Date.now() + HANDOFF_TTL_MS;
 
-      await sleep(humanDelayMs(msgHandoff));
-      await sendWhatsAppText({ to: from, bodyText: msgHandoff, trace });
+        await sleep(humanDelayMs(msgHandoff));
+        await sendWhatsAppText({ to: from, bodyText: msgHandoff, trace });
 
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
+        await kvSetSession(from, sess);
+        continue;
+      }
 
-    if (wantsBotBack(userText)) {
-      sess.state.humanHandoffUntil = 0;
-      const back = `Fechado 🙂 Aqui é o ${SEVERINO_NAME}. Me diz o que você precisa agora.`;
-      await sleep(humanDelayMs(back));
-      await sendWhatsAppText({ to: from, bodyText: back, trace });
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
+      if (wantsBotBack(userText)) {
+        sess.state.humanHandoffUntil = 0;
+        const back = `Fechado 🙂 Aqui é o ${SEVERINO_NAME}. Me diz o que você precisa agora.`;
+        await sleep(humanDelayMs(back));
+        await sendWhatsAppText({ to: from, bodyText: back, trace });
+        await kvSetSession(from, sess);
+        continue;
+      }
 
-    const gHint = genderHintFromText(userText);
-    if (gHint) sess.profile.gender = gHint;
+      const gHint = genderHintFromText(userText);
+      if (gHint) sess.profile.gender = gHint;
 
-    // capturar nome
-    if (!sess.profile.name) {
-      const maybe = extractName(userText);
-      if (maybe) {
-        sess.profile.name = maybe;
-        if (!sess.profile.gender) sess.profile.gender = inferGenderFromName(maybe);
+      // capturar nome
+      if (!sess.profile.name) {
+        const maybe = extractName(userText);
+        if (maybe) {
+          sess.profile.name = maybe;
+          if (!sess.profile.gender) sess.profile.gender = inferGenderFromName(maybe);
 
-        const addr = friendlyAddress(sess.profile);
-        const hi = `Perfeito, ${sess.profile.name}! 🙂  
+          const addr = friendlyAddress(sess.profile);
+          const hi = `Perfeito, ${sess.profile.name}! 🙂  
 Eu sou o ${SEVERINO_NAME}, assistente da Universidade da Resina.  
 Me diz, ${addr}: você quer tirar uma dúvida, mandar foto/áudio, ou quer calcular resina?`;
 
-        await sleep(humanDelayMs(hi));
-        await sendWhatsAppText({ to: from, bodyText: hi, trace });
+          await sleep(humanDelayMs(hi));
+          await sendWhatsAppText({ to: from, bodyText: hi, trace });
 
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
+          await kvSetSession(from, sess);
+          continue;
+        }
 
-      if (!sess.profile.askedName) {
-        sess.profile.askedName = true;
-        const intro = `Olá! Eu sou o ${SEVERINO_NAME}, assistente da Universidade da Resina.  
+        if (!sess.profile.askedName) {
+          sess.profile.askedName = true;
+          const intro = `Olá! Eu sou o ${SEVERINO_NAME}, assistente da Universidade da Resina.  
 Tô aqui pra te ajudar no que precisar — dúvidas, cálculos, áudios e fotos.
 
 Como posso te chamar? 🙂`;
 
-        await sleep(humanDelayMs(intro));
-        await sendWhatsAppText({ to: from, bodyText: intro, trace });
+          await sleep(humanDelayMs(intro));
+          await sendWhatsAppText({ to: from, bodyText: intro, trace });
+
+          await kvSetSession(from, sess);
+          continue;
+        }
+      }
+
+      /* =========================
+         #reset
+         ========================= */
+      if (normalizeLoose(userText) === "#reset") {
+        await kvDelSession(from);
+        const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
+        await sleep(humanDelayMs(ok));
+        await sendWhatsAppText({ to: from, bodyText: ok, trace });
+        continue;
+      }
+
+      /* =========================
+         ✅ Pós-cálculo (menu 1/2)
+         ========================= */
+      if (sess.state.pendingAfterCalc) {
+        const s = normalizeLoose(userText);
+
+        const wantsAgain = ["1", "sim", "s", "quero", "bora", "vamos", "ok", "beleza"].includes(s);
+        const wantsMentor = ["2", "nao", "não", "n", "depois"].includes(s);
+
+        if (wantsAgain) {
+          sess.state.pendingAfterCalc = false;
+          sess.state.mode = "calc";
+          sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
+
+          const prompt = calcNextPrompt(sess.state.calc);
+          await sleep(humanDelayMs(prompt));
+          await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+          await kvSetSession(from, sess);
+          continue;
+        }
+
+        if (wantsMentor) {
+          sess.state.pendingAfterCalc = false;
+          const ok = "Fechado 🙂 Voltamos pro mentor. Me manda sua dúvida.";
+          await sleep(humanDelayMs(ok));
+          await sendWhatsAppText({ to: from, bodyText: ok, trace });
+
+          await kvSetSession(from, sess);
+          continue;
+        }
+
+        const again = "Só pra eu entender: quer calcular outra peça? Responde 1 (sim) ou 2 (não).";
+        await sleep(humanDelayMs(again));
+        await sendWhatsAppText({ to: from, bodyText: again, trace });
 
         await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
+        continue;
       }
-    }
 
-    /* =========================
-       #reset
-       ========================= */
-    if (normalizeLoose(userText) === "#reset") {
-      await kvDelSession(from);
-      const ok = "Sessão resetada ✅ Pode mandar sua dúvida do zero.";
-      await sleep(humanDelayMs(ok));
-      await sendWhatsAppText({ to: from, bodyText: ok, trace });
-      return res.status(200).json({ ok: true });
-    }
+      /* =========================
+         Escape calc (sair/menu)
+         ========================= */
+      if (sess.state.mode === "calc" || sess.state.pendingCalcConfirm) {
+        if (isEscapeCalc(userText)) {
+          sess.state.mode = "mentor";
+          sess.state.calc = null;
+          sess.state.pendingCalcConfirm = false;
 
-    /* =========================
-       ✅ Pós-cálculo (menu 1/2)
-       ========================= */
-    if (sess.state.pendingAfterCalc) {
-      const s = normalizeLoose(userText);
+          const ok =
+            "Fechado 🙂 Saímos da calculadora e voltamos pro mentor. Me diz qual é a tua dúvida agora (ou, se quiser calcular depois, é só mandar “quero calcular”).";
+          await sleep(humanDelayMs(ok));
+          await sendWhatsAppText({ to: from, bodyText: ok, trace });
 
-      const wantsAgain = ["1", "sim", "s", "quero", "bora", "vamos", "ok", "beleza"].includes(s);
-      const wantsMentor = ["2", "nao", "não", "n", "depois"].includes(s);
+          await kvSetSession(from, sess);
+          continue;
+        }
+      }
 
-      if (wantsAgain) {
-        sess.state.pendingAfterCalc = false;
+      /* =========================
+         IMAGEM pendente -> analisar
+         ========================= */
+      if (sess.state.pendingImage?.mediaId) {
+        if (isCancel(userText)) {
+          sess.state.pendingImage = null;
+          await kvSetSession(from, sess);
+
+          const ok = "Fechado 🙂 Se quiser, manda outra foto depois e me diz o que você quer avaliar.";
+          await sleep(humanDelayMs(ok));
+          await sendWhatsAppText({ to: from, bodyText: ok, trace });
+          continue;
+        }
+
+        const { mediaId, caption } = sess.state.pendingImage;
+
+        const ack = "Boa — tô analisando a foto agora 📸";
+        await sleep(humanDelayMs(ack));
+        await sendWhatsAppText({ to: from, bodyText: ack, trace });
+
+        const meta = await getWhatsAppMediaMeta(mediaId, trace);
+        if (!meta?.url) {
+          sess.state.pendingImage = null;
+          await kvSetSession(from, sess);
+
+          const fail = "Não consegui baixar essa foto 😅 Pode reenviar (boa luz) e me dizer o que avaliar?";
+          await sleep(humanDelayMs(fail));
+          await sendWhatsAppText({ to: from, bodyText: fail, trace });
+          continue;
+        }
+
+        if (meta.file_size && Number(meta.file_size) > 6_000_000) {
+          sess.state.pendingImage = null;
+          await kvSetSession(from, sess);
+
+          const big =
+            "Essa foto veio bem pesada 😅 Se puder, manda de novo em resolução menor (como ‘foto’ normal, não ‘documento’) que eu analiso certinho.";
+          await sleep(humanDelayMs(big));
+          await sendWhatsAppText({ to: from, bodyText: big, trace });
+          continue;
+        }
+
+        const file = await downloadWhatsAppMediaFile(meta.url, trace);
+        if (!file?.arrayBuffer) {
+          sess.state.pendingImage = null;
+          await kvSetSession(from, sess);
+
+          const fail = "Não consegui baixar essa foto 😅 Pode reenviar com mais luz e mais perto da peça?";
+          await sleep(humanDelayMs(fail));
+          await sendWhatsAppText({ to: from, bodyText: fail, trace });
+          continue;
+        }
+
+        const analysis = await analyzeImageWithOpenAI({
+          imageArrayBuffer: file.arrayBuffer,
+          mimeType: meta.mime_type || file.contentType || "image/jpeg",
+          userRequest: userText,
+          caption,
+          history: sess.history,
+          trace,
+          profile: sess.profile,
+        });
+
+        sess.state.pendingImage = null;
+
+        sess.history.push({ role: "user", content: `🖼️ (imagem) ${userText.slice(0, 300)}` });
+        sess.history.push({ role: "assistant", content: analysis.slice(0, 900) });
+        if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
+
+        await kvSetSession(from, sess);
+
+        const parts = splitMessageSmart(analysis, 6);
+        for (const part of parts) {
+          await sleep(humanDelayMs(part));
+          await sendWhatsAppText({ to: from, bodyText: part, trace });
+        }
+        continue;
+      }
+
+      /* =========================
+         debug calc (#calc)
+         ========================= */
+      if (normalizeLoose(userText) === "#calc") {
         sess.state.mode = "calc";
         sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
+        sess.state.pendingCalcConfirm = false;
 
         const prompt = calcNextPrompt(sess.state.calc);
         await sleep(humanDelayMs(prompt));
         await sendWhatsAppText({ to: from, bodyText: prompt, trace });
 
         await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
+        continue;
       }
 
-      if (wantsMentor) {
-        sess.state.pendingAfterCalc = false;
-        const ok = "Fechado 🙂 Voltamos pro mentor. Me manda sua dúvida.";
-        await sleep(humanDelayMs(ok));
-        await sendWhatsAppText({ to: from, bodyText: ok, trace });
+      /* =========================
+         pendência de plano em partes
+         ========================= */
+      if (sess.state.pendingLong && isContinueText(userText)) {
+        const p = sess.state.pendingLong.parts;
+        const next = p.splice(0, 2);
+        if (!p.length) sess.state.pendingLong = null;
+
+        for (const part of next) {
+          await sleep(humanDelayMs(part));
+          await sendWhatsAppText({ to: from, bodyText: part, trace });
+        }
+        if (sess.state.pendingLong) {
+          const ask = "Quer que eu continue? (sim/continuar)";
+          await sleep(humanDelayMs(ask));
+          await sendWhatsAppText({ to: from, bodyText: ask, trace });
+        }
 
         await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
+        continue;
       }
 
-      const again = "Só pra eu entender: quer calcular outra peça? Responde 1 (sim) ou 2 (não).";
-      await sleep(humanDelayMs(again));
-      await sendWhatsAppText({ to: from, bodyText: again, trace });
+      /* =========================
+         Oferta da calculadora
+         ========================= */
+      if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
+        sess.state.pendingCalcConfirm = true;
 
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
-
-    /* =========================
-       Escape calc (sair/menu)
-       ========================= */
-    if (sess.state.mode === "calc" || sess.state.pendingCalcConfirm) {
-      if (isEscapeCalc(userText)) {
-        sess.state.mode = "mentor";
-        sess.state.calc = null;
-        sess.state.pendingCalcConfirm = false;
-
-        const ok =
-          "Fechado 🙂 Saímos da calculadora e voltamos pro mentor. Me diz qual é a tua dúvida agora (ou, se quiser calcular depois, é só mandar “quero calcular”).";
-        await sleep(humanDelayMs(ok));
-        await sendWhatsAppText({ to: from, bodyText: ok, trace });
-
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
-      }
-    }
-
-    /* =========================
-       IMAGEM pendente -> analisar
-       ========================= */
-    if (sess.state.pendingImage?.mediaId) {
-      if (isCancel(userText)) {
-        sess.state.pendingImage = null;
-        await kvSetSession(from, sess);
-
-        const ok = "Fechado 🙂 Se quiser, manda outra foto depois e me diz o que você quer avaliar.";
-        await sleep(humanDelayMs(ok));
-        await sendWhatsAppText({ to: from, bodyText: ok, trace });
-        return res.status(200).json({ ok: true });
-      }
-
-      const { mediaId, caption } = sess.state.pendingImage;
-
-      const ack = "Boa — tô analisando a foto agora 📸";
-      await sleep(humanDelayMs(ack));
-      await sendWhatsAppText({ to: from, bodyText: ack, trace });
-
-      const meta = await getWhatsAppMediaMeta(mediaId, trace);
-      if (!meta?.url) {
-        sess.state.pendingImage = null;
-        await kvSetSession(from, sess);
-
-        const fail = "Não consegui baixar essa foto 😅 Pode reenviar (boa luz) e me dizer o que avaliar?";
-        await sleep(humanDelayMs(fail));
-        await sendWhatsAppText({ to: from, bodyText: fail, trace });
-        return res.status(200).json({ ok: true });
-      }
-
-      if (meta.file_size && Number(meta.file_size) > 6_000_000) {
-        sess.state.pendingImage = null;
-        await kvSetSession(from, sess);
-
-        const big =
-          "Essa foto veio bem pesada 😅 Se puder, manda de novo em resolução menor (como ‘foto’ normal, não ‘documento’) que eu analiso certinho.";
-        await sleep(humanDelayMs(big));
-        await sendWhatsAppText({ to: from, bodyText: big, trace });
-        return res.status(200).json({ ok: true });
-      }
-
-      const file = await downloadWhatsAppMediaFile(meta.url, trace);
-      if (!file?.arrayBuffer) {
-        sess.state.pendingImage = null;
-        await kvSetSession(from, sess);
-
-        const fail = "Não consegui baixar essa foto 😅 Pode reenviar com mais luz e mais perto da peça?";
-        await sleep(humanDelayMs(fail));
-        await sendWhatsAppText({ to: from, bodyText: fail, trace });
-        return res.status(200).json({ ok: true });
-      }
-
-      const analysis = await analyzeImageWithOpenAI({
-        imageArrayBuffer: file.arrayBuffer,
-        mimeType: meta.mime_type || file.contentType || "image/jpeg",
-        userRequest: userText,
-        caption,
-        history: sess.history,
-        trace,
-        profile: sess.profile,
-      });
-
-      sess.state.pendingImage = null;
-
-      sess.history.push({ role: "user", content: `🖼️ (imagem) ${userText.slice(0, 300)}` });
-      sess.history.push({ role: "assistant", content: analysis.slice(0, 900) });
-      if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
-
-      await kvSetSession(from, sess);
-
-      const parts = splitMessageSmart(analysis, 6);
-      for (const part of parts) {
-        await sleep(humanDelayMs(part));
-        await sendWhatsAppText({ to: from, bodyText: part, trace });
-      }
-      return res.status(200).json({ ok: true });
-    }
-
-    /* =========================
-       debug calc (#calc)
-       ========================= */
-    if (normalizeLoose(userText) === "#calc") {
-      sess.state.mode = "calc";
-      sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
-      sess.state.pendingCalcConfirm = false;
-
-      const prompt = calcNextPrompt(sess.state.calc);
-      await sleep(humanDelayMs(prompt));
-      await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
-
-    /* =========================
-       pendência de plano em partes
-       ========================= */
-    if (sess.state.pendingLong && isContinueText(userText)) {
-      const p = sess.state.pendingLong.parts;
-      const next = p.splice(0, 2);
-      if (!p.length) sess.state.pendingLong = null;
-
-      for (const part of next) {
-        await sleep(humanDelayMs(part));
-        await sendWhatsAppText({ to: from, bodyText: part, trace });
-      }
-      if (sess.state.pendingLong) {
-        const ask = "Quer que eu continue? (sim/continuar)";
-        await sleep(humanDelayMs(ask));
-        await sendWhatsAppText({ to: from, bodyText: ask, trace });
-      }
-
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
-
-    /* =========================
-       Oferta da calculadora
-       ========================= */
-    if (sess.state.mode !== "calc" && isCalcIntent(userText) && !sess.state.pendingCalcConfirm) {
-      sess.state.pendingCalcConfirm = true;
-
-      const offer = `🧮 Quer usar a *Calculadora de Resina* agora?
+        const offer = `🧮 Quer usar a *Calculadora de Resina* agora?
 
 1) Sim, quero calcular
 2) Não, só uma orientação
 (Se quiser sair: manda "sair")`;
 
-      await sleep(humanDelayMs(offer));
-      await sendWhatsAppText({ to: from, bodyText: offer, trace });
-
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
-
-    if (sess.state.pendingCalcConfirm) {
-      if (isYes(userText)) {
-        sess.state.pendingCalcConfirm = false;
-        sess.state.mode = "calc";
-        sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
-
-        const prompt = calcNextPrompt(sess.state.calc);
-        await sleep(humanDelayMs(prompt));
-        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+        await sleep(humanDelayMs(offer));
+        await sendWhatsAppText({ to: from, bodyText: offer, trace });
 
         await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
+        continue;
       }
 
-      if (isNo(userText)) {
-        sess.state.pendingCalcConfirm = false;
-        // segue mentor
-      } else {
-        const again = 'Só pra eu entender: quer usar a calculadora? Responde 1 (sim) ou 2 (não). (ou manda "sair")';
-        await sleep(humanDelayMs(again));
-        await sendWhatsAppText({ to: from, bodyText: again, trace });
+      if (sess.state.pendingCalcConfirm) {
+        if (isYes(userText)) {
+          sess.state.pendingCalcConfirm = false;
+          sess.state.mode = "calc";
+          sess.state.calc = { shape: null, kit: { resinG: null, hardG: null }, pendingUnit: null };
 
-        await kvSetSession(from, sess);
-        return res.status(200).json({ ok: true });
+          const prompt = calcNextPrompt(sess.state.calc);
+          await sleep(humanDelayMs(prompt));
+          await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+
+          await kvSetSession(from, sess);
+          continue;
+        }
+
+        if (isNo(userText)) {
+          sess.state.pendingCalcConfirm = false;
+          // segue mentor
+        } else {
+          const again = 'Só pra eu entender: quer usar a calculadora? Responde 1 (sim) ou 2 (não). (ou manda "sair")';
+          await sleep(humanDelayMs(again));
+          await sendWhatsAppText({ to: from, bodyText: again, trace });
+
+          await kvSetSession(from, sess);
+          continue;
+        }
       }
-    }
 
-    /* =========================
-       MODO CALC (100% estável)
-       ========================= */
-    /* =========================
-   MODO CALC (100% estável) ✅ FIX FINAL
-   ========================= */
-if (sess.state.mode === "calc" && sess.state.calc) {
-  const calc = sess.state.calc;
-  calc.kit ??= { resinG: null, hardG: null };
-  calc.pendingUnit ??= null;
+      /* =========================
+         MODO CALC (100% estável) ✅ FIX FINAL + FIX NULL
+         ========================= */
+      if (sess.state.mode === "calc" && sess.state.calc) {
+        const calc = sess.state.calc;
+        calc.kit ??= { resinG: null, hardG: null };
+        calc.pendingUnit ??= null;
 
-  // ✅ helper: pergunta unidade e ENCERRA request
-  const askUnit = async (kind, key, raw) => {
-    calc.pendingUnit = { kind, key, raw };
-    const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
-    await sleep(humanDelayMs(ask));
-    await sendWhatsAppText({ to: from, bodyText: ask, trace });
-    await kvSetSession(from, sess);
-    return res.status(200).json({ ok: true });
-  };
+        const askUnit = async (kind, key, raw) => {
+          calc.pendingUnit = { kind, key, raw };
+          const ask = kind === "len" ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
+          await sleep(humanDelayMs(ask));
+          await sendWhatsAppText({ to: from, bodyText: ask, trace });
+          await kvSetSession(from, sess);
+        };
 
-  // ✅ FIX GLOBAL: se chegou unidade, aplica e ENCERRA (não pula etapa)
-  if (calc.pendingUnit) {
-    const prev = calc.pendingUnit;
-    const u = parseUnitOnly(userText);
+        // ✅ se chegou unidade, aplica; se não houver "next", deixa finalizar no mesmo ciclo
+        if (calc.pendingUnit) {
+          const prev = calc.pendingUnit;
+          const u = parseUnitOnly(userText);
 
-    const isLen = prev.kind === "len";
-    const isWeight = prev.kind === "weight";
+          const isLen = prev.kind === "len";
+          const isWeight = prev.kind === "weight";
 
-    const okUnit =
-      (isLen && (u === "mm" || u === "cm" || u === "m")) ||
-      (isWeight && (u === "g" || u === "kg"));
+          const okUnit =
+            (isLen && (u === "mm" || u === "cm" || u === "m")) ||
+            (isWeight && (u === "g" || u === "kg"));
 
-    if (!okUnit) {
-      const again = isLen ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
-      await sleep(humanDelayMs(again));
-      await sendWhatsAppText({ to: from, bodyText: again, trace });
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
+          if (!okUnit) {
+            const again = isLen ? "Qual unidade você quis dizer? (mm, cm ou m)" : "Qual unidade? (g ou kg)";
+            await sleep(humanDelayMs(again));
+            await sendWhatsAppText({ to: from, bodyText: again, trace });
+            await kvSetSession(from, sess);
+            continue;
+          }
 
-    const applied = applyUnitToBareNumber(prev.raw, u);
-    if (applied != null) {
-      if (isLen) calc[prev.key] = applied; // cm
-      else {
-        if (prev.key === "resinG") calc.kit.resinG = applied; // g
-        if (prev.key === "hardG") calc.kit.hardG = applied; // g
-      }
-    }
+          const applied = applyUnitToBareNumber(prev.raw, u);
+          if (applied != null) {
+            if (isLen) calc[prev.key] = applied; // cm
+            else {
+              if (prev.key === "resinG") calc.kit.resinG = applied; // g
+              if (prev.key === "hardG") calc.kit.hardG = applied; // g
+            }
+          }
 
-    calc.pendingUnit = null;
+          calc.pendingUnit = null;
 
-    const next = calcNextPrompt(calc);
-    await sleep(humanDelayMs(next));
-    await sendWhatsAppText({ to: from, bodyText: next, trace });
+          const next = calcNextPrompt(calc);
+          if (next) {
+            await sleep(humanDelayMs(next));
+            await sendWhatsAppText({ to: from, bodyText: next, trace });
+            await kvSetSession(from, sess);
+            continue;
+          }
+          // se next === null, cai pra finalização abaixo (mesmo ciclo)
+        }
 
-    await kvSetSession(from, sess);
-    return res.status(200).json({ ok: true });
-  }
+        // shape selection
+        if (!calc.shape) {
+          const n = userText.trim();
+          if (n === "1") calc.shape = "retangulo";
+          else if (n === "2") calc.shape = "cilindro";
+          else if (n === "3") calc.shape = "canaleta";
+          else if (n === "4") calc.shape = "camada";
+          else {
+            const again = buildCalcMenu();
+            await sleep(humanDelayMs(again));
+            await sendWhatsAppText({ to: from, bodyText: again, trace });
+            await kvSetSession(from, sess);
+            continue;
+          }
 
-  // shape selection
-  if (!calc.shape) {
-    const n = userText.trim();
-    if (n === "1") calc.shape = "retangulo";
-    else if (n === "2") calc.shape = "cilindro";
-    else if (n === "3") calc.shape = "canaleta";
-    else if (n === "4") calc.shape = "camada";
-    else {
-      const again = buildCalcMenu();
-      await sleep(humanDelayMs(again));
-      await sendWhatsAppText({ to: from, bodyText: again, trace });
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
+          const prompt = calcNextPrompt(calc);
+          await sleep(humanDelayMs(prompt));
+          await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+          await kvSetSession(from, sess);
+          continue;
+        }
 
-    const prompt = calcNextPrompt(calc);
-    await sleep(humanDelayMs(prompt));
-    await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-    await kvSetSession(from, sess);
-    return res.status(200).json({ ok: true });
-  }
+        // ✅ helper: salva e só pergunta se existir "next"
+        const commitAndAskNext = async () => {
+          const next = calcNextPrompt(calc);
+          await kvSetSession(from, sess);
 
-  // ✅ helper: quando salva algo (medida/peso), SEMPRE pergunta o próximo e retorna
-  const commitAndAskNext = async () => {
-    const next = calcNextPrompt(calc);
-    await sleep(humanDelayMs(next));
-    await sendWhatsAppText({ to: from, bodyText: next, trace });
-    await kvSetSession(from, sess);
-    return res.status(200).json({ ok: true });
-  };
+          if (!next) return false; // ✅ sem próxima pergunta -> vai finalizar no mesmo ciclo
 
-  // helper: set length (supports bare number -> ask unit)
-  const setLenStep = async (key, labelMsg) => {
-    if (isBareNumber(userText)) {
-      return await askUnit("len", key, userText.trim().replace(",", "."));
-    }
-    const v = parseLengthToCm(userText);
-    if (v == null) {
-      await sendCalcInvalid({
-        to: from,
-        trace,
-        msg: `Não consegui entender ${labelMsg} 😅`,
-        prompt: "Manda com unidade: ex 30cm, 1m, 5mm",
-      });
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
-    calc[key] = v;
-    return await commitAndAskNext(); // ✅ RETORNA AQUI (não continua)
-  };
+          await sleep(humanDelayMs(next));
+          await sendWhatsAppText({ to: from, bodyText: next, trace });
+          return true;
+        };
 
-  // helper: set weight A/B (supports bare number -> ask unit)
-  const setWeightStep = async (key, prettyName) => {
-    if (isBareNumber(userText)) {
-      return await askUnit("weight", key, userText.trim().replace(",", "."));
-    }
-    const g = parseWeightToG(userText);
-    if (g == null) {
-      await sendCalcInvalid({
-        to: from,
-        trace,
-        msg: `Não consegui entender o ${prettyName} 😅`,
-        prompt: "Manda com unidade: ex 1kg ou 500g",
-      });
-      await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
-    }
-    if (key === "resinG") calc.kit.resinG = g;
-    if (key === "hardG") calc.kit.hardG = g;
-    return await commitAndAskNext(); // ✅ RETORNA AQUI
-  };
+        const setLenStep = async (key, labelMsg) => {
+          if (isBareNumber(userText)) {
+            await askUnit("len", key, userText.trim().replace(",", "."));
+            return true; // encerra ciclo (perguntou unidade)
+          }
+          const v = parseLengthToCm(userText);
+          if (v == null) {
+            await sendCalcInvalid({
+              to: from,
+              trace,
+              msg: `Não consegui entender ${labelMsg} 😅`,
+              prompt: "Manda com unidade: ex 30cm, 1m, 5mm",
+            });
+            await kvSetSession(from, sess);
+            return true;
+          }
+          calc[key] = v;
+          const asked = await commitAndAskNext();
+          return asked; // se perguntou próximo, encerra; se não, deixa finalizar
+        };
 
-  // ✅ fluxo de medidas por shape (um passo por mensagem)
-  if (calc.shape === "retangulo") {
-    if (calc.c_cm == null) return await setLenStep("c_cm", "o comprimento");
-    if (calc.l_cm == null) return await setLenStep("l_cm", "a largura");
-    if (calc.a_cm == null) return await setLenStep("a_cm", "a espessura/altura");
-  }
+        const setWeightStep = async (key, prettyName) => {
+          if (isBareNumber(userText)) {
+            await askUnit("weight", key, userText.trim().replace(",", "."));
+            return true;
+          }
+          const g = parseWeightToG(userText);
+          if (g == null) {
+            await sendCalcInvalid({
+              to: from,
+              trace,
+              msg: `Não consegui entender o ${prettyName} 😅`,
+              prompt: "Manda com unidade: ex 1kg ou 500g",
+            });
+            await kvSetSession(from, sess);
+            return true;
+          }
+          if (key === "resinG") calc.kit.resinG = g;
+          if (key === "hardG") calc.kit.hardG = g;
 
-  if (calc.shape === "cilindro") {
-    if (calc.diam_cm == null) return await setLenStep("diam_cm", "o diâmetro");
-    if (calc.a_cm == null) return await setLenStep("a_cm", "a altura/profundidade");
-  }
+          const asked = await commitAndAskNext();
+          return asked;
+        };
 
-  if (calc.shape === "canaleta") {
-    if (calc.c_cm == null) return await setLenStep("c_cm", "o comprimento");
-    if (calc.l_cm == null) return await setLenStep("l_cm", "a largura");
-    if (calc.a_cm == null) return await setLenStep("a_cm", "a profundidade");
-  }
+        // fluxo de medidas
+        if (calc.shape === "retangulo") {
+          if (calc.c_cm == null) { const stop = await setLenStep("c_cm", "o comprimento"); if (stop) continue; }
+          if (calc.l_cm == null) { const stop = await setLenStep("l_cm", "a largura"); if (stop) continue; }
+          if (calc.a_cm == null) { const stop = await setLenStep("a_cm", "a espessura/altura"); if (stop) continue; }
+        }
 
-  if (calc.shape === "camada") {
-    if (calc.c_cm == null) return await setLenStep("c_cm", "o comprimento");
-    if (calc.l_cm == null) return await setLenStep("l_cm", "a largura");
-    if (calc.esp_cm == null) return await setLenStep("esp_cm", "a espessura");
-  }
+        if (calc.shape === "cilindro") {
+          if (calc.diam_cm == null) { const stop = await setLenStep("diam_cm", "o diâmetro"); if (stop) continue; }
+          if (calc.a_cm == null) { const stop = await setLenStep("a_cm", "a altura/profundidade"); if (stop) continue; }
+        }
 
-  // ✅ se medidas completas, começa kit A/B
-  const measuresComplete =
-    (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
-    (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
-    (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
-    (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
+        if (calc.shape === "canaleta") {
+          if (calc.c_cm == null) { const stop = await setLenStep("c_cm", "o comprimento"); if (stop) continue; }
+          if (calc.l_cm == null) { const stop = await setLenStep("l_cm", "a largura"); if (stop) continue; }
+          if (calc.a_cm == null) { const stop = await setLenStep("a_cm", "a profundidade"); if (stop) continue; }
+        }
 
-  if (measuresComplete && calc.kit.resinG == null) return await setWeightStep("resinG", "Componente A (Resina)");
-  if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG == null) return await setWeightStep("hardG", "Componente B (Endurecedor)");
+        if (calc.shape === "camada") {
+          if (calc.c_cm == null) { const stop = await setLenStep("c_cm", "o comprimento"); if (stop) continue; }
+          if (calc.l_cm == null) { const stop = await setLenStep("l_cm", "a largura"); if (stop) continue; }
+          if (calc.esp_cm == null) { const stop = await setLenStep("esp_cm", "a espessura"); if (stop) continue; }
+        }
 
-  // ✅ finalizar
-  if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG != null) {
-    const done = finishCalcMessage(calc);
+        const measuresComplete =
+          (calc.shape === "retangulo" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
+          (calc.shape === "cilindro" && calc.diam_cm != null && calc.a_cm != null) ||
+          (calc.shape === "canaleta" && calc.c_cm != null && calc.l_cm != null && calc.a_cm != null) ||
+          (calc.shape === "camada" && calc.c_cm != null && calc.l_cm != null && calc.esp_cm != null);
 
-    sess.state.mode = "mentor";
-    sess.state.calc = null;
+        if (measuresComplete && calc.kit.resinG == null) {
+          const stop = await setWeightStep("resinG", "Componente A (Resina)");
+          if (stop) continue;
+        }
+        if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG == null) {
+          const stop = await setWeightStep("hardG", "Componente B (Endurecedor)");
+          if (stop) continue;
+        }
 
-    const parts = splitMessageSmart(done, 4);
-    for (const part of parts) {
-      await sleep(humanDelayMs(part));
-      await sendWhatsAppText({ to: from, bodyText: part, trace });
-    }
+        // ✅ finalizar (agora NÃO fica calado)
+        if (measuresComplete && calc.kit.resinG != null && calc.kit.hardG != null) {
+          const done = finishCalcMessage(calc);
 
-    sess.state.pendingAfterCalc = true;
-    const ask = `Quer calcular outra peça?
+          sess.state.mode = "mentor";
+          sess.state.calc = null;
+
+          const parts = splitMessageSmart(done, 4);
+          for (const part of parts) {
+            await sleep(humanDelayMs(part));
+            await sendWhatsAppText({ to: from, bodyText: part, trace });
+          }
+
+          sess.state.pendingAfterCalc = true;
+          const ask = `Quer calcular outra peça?
 
 1) Sim (calcular outra)
 2) Não (voltar pro mentor)`;
 
-    await sleep(humanDelayMs(ask));
-    await sendWhatsAppText({ to: from, bodyText: ask, trace });
+          await sleep(humanDelayMs(ask));
+          await sendWhatsAppText({ to: from, bodyText: ask, trace });
 
-    await kvSetSession(from, sess);
-    return res.status(200).json({ ok: true });
-  }
+          await kvSetSession(from, sess);
+          continue;
+        }
 
-  // fallback (não deveria cair aqui, mas garante)
-  const prompt = calcNextPrompt(calc);
-  await sleep(humanDelayMs(prompt));
-  await sendWhatsAppText({ to: from, bodyText: prompt, trace });
-  await kvSetSession(from, sess);
-  return res.status(200).json({ ok: true });
-}
+        // fallback
+        const prompt = calcNextPrompt(calc);
+        await sleep(humanDelayMs(prompt));
+        await sendWhatsAppText({ to: from, bodyText: prompt, trace });
+        await kvSetSession(from, sess);
+        continue;
+      }
 
-    /* =========================
-       MODO MENTOR
-       ========================= */
-    const replyText = await getAIReply({ history: sess.history, userText, trace, profile: sess.profile });
+      /* =========================
+         MODO MENTOR
+         ========================= */
+      const replyText = await getAIReply({ history: sess.history, userText, trace, profile: sess.profile });
 
-    sess.history.push({ role: "user", content: userText.slice(0, 700) });
-    sess.history.push({ role: "assistant", content: replyText.slice(0, 900) });
-    if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
+      sess.history.push({ role: "user", content: userText.slice(0, 700) });
+      sess.history.push({ role: "assistant", content: replyText.slice(0, 900) });
+      if (sess.history.length > 18) sess.history.splice(0, sess.history.length - 18);
 
-    const parts = splitMessageSmart(replyText, 6);
-    const shouldChunkLong = looksLikePlanRequest(userText) || (replyText && replyText.length > 1600);
+      const parts = splitMessageSmart(replyText, 6);
+      const shouldChunkLong = looksLikePlanRequest(userText) || (replyText && replyText.length > 1600);
 
-    if (shouldChunkLong && parts.length > 2) {
-      const first = parts.slice(0, 2);
-      const rest = parts.slice(2);
+      if (shouldChunkLong && parts.length > 2) {
+        const first = parts.slice(0, 2);
+        const rest = parts.slice(2);
 
-      for (const part of first) {
+        for (const part of first) {
+          await sleep(humanDelayMs(part));
+          await sendWhatsAppText({ to: from, bodyText: part, trace });
+        }
+
+        sess.state.pendingLong = { fullText: replyText, parts: rest };
+
+        const ask = "Quer que eu continue em partes? (sim/continuar)";
+        await sleep(humanDelayMs(ask));
+        await sendWhatsAppText({ to: from, bodyText: ask, trace });
+
+        await kvSetSession(from, sess);
+        continue;
+      }
+
+      for (const part of parts) {
         await sleep(humanDelayMs(part));
         await sendWhatsAppText({ to: from, bodyText: part, trace });
       }
 
-      sess.state.pendingLong = { fullText: replyText, parts: rest };
-
-      const ask = "Quer que eu continue em partes? (sim/continuar)";
-      await sleep(humanDelayMs(ask));
-      await sendWhatsAppText({ to: from, bodyText: ask, trace });
-
       await kvSetSession(from, sess);
-      return res.status(200).json({ ok: true });
+      continue;
     }
 
-    for (const part of parts) {
-      await sleep(humanDelayMs(part));
-      await sendWhatsAppText({ to: from, bodyText: part, trace });
-    }
-
-    await kvSetSession(from, sess);
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.log("❌ Handler error:", err);
