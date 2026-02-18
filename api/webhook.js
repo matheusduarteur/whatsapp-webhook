@@ -855,6 +855,13 @@ export default async function handler(req, res) {
 
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
     const value = body?.entry?.[0]?.changes?.[0]?.value;
+     const SEVERINO_PHONE_NUMBER_ID = "482912881574317";
+const incomingPhoneId = value?.metadata?.phone_number_id;
+
+if (incomingPhoneId && incomingPhoneId !== SEVERINO_PHONE_NUMBER_ID) {
+  return res.status(200).json({ ok: true });
+}
+
 
     if (value?.statuses?.length) return res.status(200).json({ ok: true });
 
